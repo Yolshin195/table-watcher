@@ -6,6 +6,7 @@
 Вся логика FSM, дебаунс, аналитика — здесь.
 """
 import os
+import matplotlib.pyplot as plt
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Optional
@@ -27,6 +28,12 @@ class TableState(Enum):
     EMPTY    = auto()   # Стол пустой, никого нет
     OCCUPIED = auto()   # За столом сидит гость
     APPROACH = auto()   # Кто-то подошёл впервые после периода пустоты
+
+TABLE_STATE_COLORS = {
+    TableState.EMPTY: (0, 255, 0),      # Зеленый
+    TableState.OCCUPIED: (0, 0, 255),   # Красный
+    TableState.APPROACH: (0, 255, 255), # Желтый (подход)
+}
 
 
 @dataclass(frozen=True)
@@ -333,6 +340,90 @@ class TableMonitor:
 
 
 # -----------------------------------------------------------------------
+# AnalyticsReporter
+# -----------------------------------------------------------------------
+class AnalyticsReporter:
+    """
+    Класс для генерации наглядных отчетов: графиков, консольных сводок и CSV.
+    """
+    def __init__(self, output_dir: str, colors: dict):
+        self.output_dir = output_dir
+        self.colors_hex = {
+            state: self._rgb_to_hex(color) 
+            for state, color in colors.items()
+        }
+        os.makedirs(self.output_dir, exist_ok=True)
+
+    def _rgb_to_hex(self, rgb):
+        """Конвертирует BGR (OpenCV) в HEX для Matplotlib."""
+        return '#%02x%02x%02x' % (rgb[2], rgb[1], rgb[0])
+
+    def generate_all(self, monitor: TableMonitor):
+        """Запускает полный цикл формирования отчетности."""
+        analytics = monitor.get_analytics()
+        df_events = monitor.get_events_dataframe()
+        df_cycles = monitor.get_cycles_dataframe()
+        df_history = monitor.get_state_history_dataframe()
+
+        # 1. Визуальный отчет (Timeline)
+        self._save_visual_timeline(df_history, analytics)
+
+        # 2. Текстовый Summary в консоль
+        self._print_console_summary(analytics, monitor.state)
+
+        # 3. Сохранение данных
+        df_events.to_csv(f"{self.output_dir}/events_log.csv", index=False)
+        df_cycles.to_csv(f"{self.output_dir}/cleanup_analytics.csv", index=False)
+        df_history.to_csv(f"{self.output_dir}/state_history.csv", index=False)
+        
+        print(f"\n[SUCCESS] Отчеты сохранены в папку: {self.output_dir}")
+
+    def _print_console_summary(self, analytics: dict, current_state):
+        print("\n" + "═"*60)
+        print(" ИТОГОВЫЙ БИЗНЕС-ОТЧЕТ ".center(60, "═"))
+        print(f" Текущий статус стола:      {current_state.name}")
+        print(f" Всего циклов посещения:    {analytics['total_cycles']}")
+        print(f" Из них завершено полностью: {analytics['completed_cycles']}")
+        print("-" * 60)
+        
+        if analytics['completed_cycles'] > 0:
+            print(f" СРЕДНЕЕ ВРЕМЯ ОЖИДАНИЯ:    {analytics['mean_response_sec']} сек.")
+            print(f" Самая быстрая реакция:     {analytics['min_response_sec']} сек.")
+            print(f" Самая долгая пауза:        {analytics['max_response_sec']} сек.")
+        else:
+            print(" [!] Нет завершенных циклов для расчета среднего времени.")
+        print("═"*60)
+
+    def _save_visual_timeline(self, df_history: pd.DataFrame, analytics: dict):
+        if df_history.empty:
+            return
+
+        plt.figure(figsize=(15, 6))
+        
+        # Рисуем точки для каждого состояния
+        for state_name in df_history['state'].unique():
+            subset = df_history[df_history['state'] == state_name]
+            # Получаем цвет из палитры UI (соответствие цветов в видео и на графике)
+            from __main__ import TableState # Импорт для сопоставления Enum
+            state_enum = TableState[state_name]
+            color = self.colors_hex.get(state_enum, 'gray')
+            
+            plt.scatter(subset['timestamp_sec'], [state_name] * len(subset), 
+                        c=color, label=state_name, s=15, marker='|')
+
+        plt.title(f"Хронология состояний стола\nСреднее время между гостями: {analytics.get('mean_response_sec', 'N/A')}с")
+        plt.xlabel("Время (секунды)")
+        plt.ylabel("Состояние")
+        plt.yticks(df_history['state'].unique())
+        plt.grid(axis='x', linestyle='--', alpha=0.5)
+        plt.legend()
+        
+        plt.tight_layout()
+        plt.savefig(f"{self.output_dir}/monitoring_timeline.png", dpi=200)
+        plt.close()
+
+
+# -----------------------------------------------------------------------
 #  ROIManager
 # -----------------------------------------------------------------------
 class ROIManager:
@@ -615,28 +706,10 @@ def main():
     
     processor.process()
 
-    # 4. Формирование отчета (Требование 2 из ТЗ)
-    print("\n" + "="*30)
-    print("ИТОГОВЫЙ ОТЧЕТ")
-    print("="*30)
-    
-    analytics = monitor.get_analytics()
-    df_events = monitor.get_events_dataframe()
-    df_cycles = monitor.get_cycles_dataframe()
-    df_state_history = monitor.get_state_history_dataframe()
+    # 4. Формирование отчетности    
+    reporter = AnalyticsReporter(output_dir=OUTPUT_DIR, colors=TABLE_STATE_COLORS)
+    reporter.generate_all(monitor)
 
-    print(f"Всего циклов (уход-приход): {analytics['total_cycles']}")
-    if analytics['mean_response_sec']:
-        print(f"Среднее время реакции: {analytics['mean_response_sec']} сек.")
-    else:
-        print("Недостаточно данных для расчета среднего времени (никто не подошел к пустому столу).")
-
-    # Сохранение в CSV (Требование ТЗ)
-    df_events.to_csv(f"{OUTPUT_DIR}/events_log.csv", index=False)
-    df_cycles.to_csv(f"{OUTPUT_DIR}/cleanup_analytics.csv", index=False)
-    df_state_history.to_csv(f"{OUTPUT_DIR}/state_history.csv", index=False)
-    
-    print("\nДетальные логи сохранены в 'events_log.csv' и 'cleanup_analytics.csv'")
 
 if __name__ == "__main__":
     main()
