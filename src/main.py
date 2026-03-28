@@ -408,9 +408,7 @@ class VideoProcessor:
 
     def process(self):
         """Основной цикл обработки."""
-        polygon = self.polygon
         frame_no = 0
-
         print(f"Обработка началась (Визуализация: {'ВКЛ' if self.show_view else 'ВЫКЛ'})...")
 
         try:
@@ -419,53 +417,97 @@ class VideoProcessor:
                 if not ret:
                     break
 
-                # 1. Детекция людей (class 0 в COCO - это person)
-                results = self.model.predict(frame, classes=[0], verbose=False)[0]
-                
-                # Проверяем, есть ли хотя бы один человек в зоне ROI
-                is_occupied_now = False
-                boxes = results.boxes.xyxy.cpu().numpy() if results.boxes else []
-                
-                for box in boxes:
-                    # Центр нижней линии bbox (ноги человека) — самая точная точка для вхождения в зону
-                    center_bottom = (int((box[0] + box[2]) / 2), int(box[3]))
-                    
-                    if cv2.pointPolygonTest(polygon, center_bottom, False) >= 0:
-                        is_occupied_now = True
-                        break # Нам достаточно одного человека
+                # 1. Анализ
+                is_occupied_now, detected_people = self._analyze_frame(frame)
 
-                # 2. Обновление бизнес-логики (твой TableMonitor)
+                # 2. Логика
                 self.monitor.update(frame_no, self.fps, is_occupied_now)
 
-                # 3. Визуализация
-                current_state = self.monitor.state
-                # Цвета: EMPTY - Зеленый, OCCUPIED/APPROACH - Красный
-                color = (0, 255, 0) if current_state == TableState.EMPTY else (0, 0, 255)
+                # 3. Визуализация и ГЛАВНЫЙ цикл событий UI
+                # Мы передаем управление UI-методу, и он говорит нам, пора ли выходить
+                should_stop = self._handle_output(frame, self.monitor.state, detected_people)
                 
-                # Рисуем зону стола
-                cv2.polylines(frame, [polygon], isClosed=True, color=color, thickness=2)
-                
-                # Текст состояния
-                label = f"Status: {current_state.name}"
-                cv2.putText(frame, label, (polygon[0][0], polygon[0][1] - 10), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-
-                # Запись в файл
-                self.out.write(frame)
-
-                # Отображение на экране
-                if self.show_view:
-                    cv2.imshow("Monitoring", frame)
-                    if cv2.waitKey(1) & 0xFF == ord('q'):
-                        break
+                if should_stop:
+                    print("[INFO] Прервано пользователем (нажата 'q').")
+                    break
 
                 frame_no += 1
-
         finally:
-            self.cap.release()
-            self.out.release()
-            cv2.destroyAllWindows()
-            print("Обработка завершена. Файл 'output.mp4' сохранен.")
+            self._cleanup()
+
+    def _analyze_frame(self, frame):
+        """Детектирует людей и определяет, кто из них в ROI."""
+        results = self.model.predict(frame, classes=[0], verbose=False)[0]
+        boxes = results.boxes.xyxy.cpu().numpy() if results.boxes else []
+        
+        is_occupied_now = False
+        detected_people = []
+
+        for box in boxes:
+            # Точка проверки (ноги)
+            foot_point = (int((box[0] + box[2]) / 2), int(box[3]))
+            
+            # Проверяем вхождение в полигон
+            in_roi = cv2.pointPolygonTest(self.polygon, foot_point, False) >= 0
+            
+            if in_roi:
+                is_occupied_now = True
+            
+            # Сохраняем данные для отрисовки
+            detected_people.append({
+                "box": box.astype(int),
+                "point": foot_point,
+                "in_roi": in_roi
+            })
+            
+        return is_occupied_now, detected_people
+
+    def _handle_output(self, frame, current_state, detected_people):
+        """Рисует полигон, боксы людей и точки входа."""
+        # 1. Рисуем всех обнаруженных людей
+        for person in detected_people:
+            # Если человек в зоне — красный, если нет — синий (или любой другой)
+            color = (0, 0, 255) if person["in_roi"] else (255, 0, 0)
+            
+            # Рисуем Bounding Box
+            x1, y1, x2, y2 = person["box"]
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+            
+            # Рисуем точку, по которой считаем вход в зону
+            cv2.circle(frame, person["point"], 5, color, -1)
+
+        # 2. Рисуем основной полигон зоны
+        poly_color = (0, 255, 0) if current_state == TableState.EMPTY else (0, 0, 255)
+        cv2.polylines(frame, [self.polygon], isClosed=True, color=poly_color, thickness=2)
+        
+        # 3. Текст состояния
+        label = f"Status: {current_state.name}"
+        cv2.putText(frame, label, (self.polygon[0][0], self.polygon[0][1] - 10), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, poly_color, 2)
+
+        self.out.write(frame)
+
+        if self.show_view:
+            cv2.imshow("Monitoring", frame)
+            # waitKey ОБЯЗАТЕЛЕН для обновления окна, даже если нам не важна кнопка
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                return True
+        else:
+            # В headless-режиме waitKey не нужен для окна, 
+            # но иногда полезен для прерывания в консоли (хотя тут лучше Ctrl+C)
+            pass
+            
+        return False
+
+    def _check_exit_key(self):
+        return cv2.waitKey(1) & 0xFF == ord('q')
+
+    def _cleanup(self):
+        self.cap.release()
+        self.out.release()
+        cv2.destroyAllWindows()
+        print("Обработка завершена. Файл 'output.mp4' сохранен.")
 
 
 def main():
