@@ -6,10 +6,14 @@
 Вся логика FSM, дебаунс, аналитика — здесь.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Optional
 import pandas as pd
+import numpy as np
+import cv2
+import argparse
+from ultralytics import YOLO
 
 
 # ---------------------------------------------------------------------------
@@ -282,3 +286,169 @@ class TableMonitor:
         # После APPROACH следующий переход — обычный OCCUPIED (не APPROACH снова)
         if t.next_state == TableState.APPROACH:
             self._state = TableState.OCCUPIED
+
+
+# -----------------------------------------------------------------------
+# 
+# -----------------------------------------------------------------------
+
+class VideoProcessor:
+    def __init__(
+        self, 
+        video_path: str, 
+        monitor: TableMonitor, 
+        model_variant: str = "yolov8n.pt",
+        show_view: bool = True
+    ):
+        self.video_path = video_path
+        self.monitor = monitor
+        self.show_view = show_view
+        
+        # Инициализация детектора
+        self.model = YOLO(model_variant)
+        
+        # Видеозахват
+        self.cap = cv2.VideoCapture(video_path)
+        if not self.cap.isOpened():
+            raise ValueError(f"Не удалось открыть видео: {video_path}")
+            
+        self.fps = self.cap.get(cv2.CAP_PROP_FPS)
+        self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        
+        # Настройка записи результата (output.mp4)
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        self.out = cv2.VideoWriter('output.mp4', fourcc, self.fps, (self.width, self.height))
+
+    def _get_roi(self) -> np.ndarray:
+        """Интерактивный выбор зоны столика."""
+        ret, frame = self.cap.read()
+        if not ret:
+            raise ValueError("Не удалось прочитать первый кадр для выбора ROI")
+            
+        print("\n[ИНСТРУКЦИЯ] Выделите столик мышкой и нажмите ENTER или SPACE.")
+        print("Для отмены нажмите 'c'.")
+        
+        window_name = "Select Table ROI"
+        roi = cv2.selectROI(window_name, frame, fromCenter=False, showCrosshair=True)
+        
+        # --- ИСПРАВЛЕНИЕ ЗАВИСАНИЯ ---
+        cv2.destroyWindow(window_name)
+        # Нужно "прокрутить" очередь событий несколько раз, чтобы окно закрылось
+        for _ in range(10):
+            cv2.waitKey(1)
+        # -----------------------------
+        
+        # Сбрасываем видео на начало после выбора
+        self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        
+        x, y, w, h = roi
+        if w == 0 or h == 0:
+            print("Предупреждение: ROI не выбран, использую всё поле кадра.")
+            return np.array([[0, 0], [self.width, 0], [self.width, self.height], [0, self.height]])
+            
+        return np.array([[x, y], [x + w, y], [x + w, y + h], [x, y + h]])
+
+    def process(self):
+        """Основной цикл обработки."""
+        polygon = self._get_roi()
+        frame_no = 0
+
+        print(f"Обработка началась (Визуализация: {'ВКЛ' if self.show_view else 'ВЫКЛ'})...")
+
+        try:
+            while self.cap.isOpened():
+                ret, frame = self.cap.read()
+                if not ret:
+                    break
+
+                # 1. Детекция людей (class 0 в COCO - это person)
+                results = self.model.predict(frame, classes=[0], verbose=False)[0]
+                
+                # Проверяем, есть ли хотя бы один человек в зоне ROI
+                is_occupied_now = False
+                boxes = results.boxes.xyxy.cpu().numpy() if results.boxes else []
+                
+                for box in boxes:
+                    # Центр нижней линии bbox (ноги человека) — самая точная точка для вхождения в зону
+                    center_bottom = (int((box[0] + box[2]) / 2), int(box[3]))
+                    
+                    if cv2.pointPolygonTest(polygon, center_bottom, False) >= 0:
+                        is_occupied_now = True
+                        break # Нам достаточно одного человека
+
+                # 2. Обновление бизнес-логики (твой TableMonitor)
+                self.monitor.update(frame_no, self.fps, is_occupied_now)
+
+                # 3. Визуализация
+                current_state = self.monitor.state
+                # Цвета: EMPTY - Зеленый, OCCUPIED/APPROACH - Красный
+                color = (0, 255, 0) if current_state == TableState.EMPTY else (0, 0, 255)
+                
+                # Рисуем зону стола
+                cv2.polylines(frame, [polygon], isClosed=True, color=color, thickness=2)
+                
+                # Текст состояния
+                label = f"Status: {current_state.name}"
+                cv2.putText(frame, label, (polygon[0][0], polygon[0][1] - 10), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+                # Запись в файл
+                self.out.write(frame)
+
+                # Отображение на экране
+                if self.show_view:
+                    cv2.imshow("Monitoring", frame)
+                    if cv2.waitKey(1) & 0xFF == ord('q'):
+                        break
+
+                frame_no += 1
+
+        finally:
+            self.cap.release()
+            self.out.release()
+            cv2.destroyAllWindows()
+            print("Обработка завершена. Файл 'output.mp4' сохранен.")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Table Cleaning Detection Prototype")
+    parser.add_argument("--video", type=str, required=True, help="Путь к видеофайлу")
+    parser.add_argument("--headless", action="store_true", help="Запустить без отображения окна")
+    args = parser.parse_args()
+
+    # 1. Инициализируем бизнес-логику
+    # Дебаунс: 30 кадров (~1 сек) для пустоты, 5 кадров для появления
+    monitor = TableMonitor(min_empty_frames=30, min_occupied_frames=5)
+
+    # 2. Запускаем процессор
+    processor = VideoProcessor(
+        video_path=args.video, 
+        monitor=monitor, 
+        show_view=not args.headless
+    )
+    
+    processor.process()
+
+    # 3. Формирование отчета (Требование 2 из ТЗ)
+    print("\n" + "="*30)
+    print("ИТОГОВЫЙ ОТЧЕТ")
+    print("="*30)
+    
+    analytics = monitor.get_analytics()
+    df_events = monitor.get_events_dataframe()
+    df_cycles = monitor.get_cycles_dataframe()
+
+    print(f"Всего циклов (уход-приход): {analytics['total_cycles']}")
+    if analytics['mean_response_sec']:
+        print(f"Среднее время реакции: {analytics['mean_response_sec']} сек.")
+    else:
+        print("Недостаточно данных для расчета среднего времени (никто не подошел к пустому столу).")
+
+    # Сохранение в CSV (Требование ТЗ)
+    df_events.to_csv("events_log.csv", index=False)
+    df_cycles.to_csv("cleanup_analytics.csv", index=False)
+    print("\nДетальные логи сохранены в 'events_log.csv' и 'cleanup_analytics.csv'")
+
+if __name__ == "__main__":
+    main()
