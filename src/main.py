@@ -406,35 +406,6 @@ class VideoProcessor:
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         self.out = cv2.VideoWriter(f'{OUTPUT_DIR}/output.mp4', fourcc, self.fps, (self.width, self.height))
 
-    def _get_roi(self) -> np.ndarray:
-        """Интерактивный выбор зоны столика."""
-        ret, frame = self.cap.read()
-        if not ret:
-            raise ValueError("Не удалось прочитать первый кадр для выбора ROI")
-            
-        print("\n[ИНСТРУКЦИЯ] Выделите столик мышкой и нажмите ENTER или SPACE.")
-        print("Для отмены нажмите 'c'.")
-        
-        window_name = "Select Table ROI"
-        roi = cv2.selectROI(window_name, frame, fromCenter=False, showCrosshair=True)
-        
-        # --- ИСПРАВЛЕНИЕ ЗАВИСАНИЯ ---
-        cv2.destroyWindow(window_name)
-        # Нужно "прокрутить" очередь событий несколько раз, чтобы окно закрылось
-        for _ in range(10):
-            cv2.waitKey(1)
-        # -----------------------------
-        
-        # Сбрасываем видео на начало после выбора
-        self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-        
-        x, y, w, h = roi
-        if w == 0 or h == 0:
-            print("Предупреждение: ROI не выбран, использую всё поле кадра.")
-            return np.array([[0, 0], [self.width, 0], [self.width, self.height], [0, self.height]])
-            
-        return np.array([[x, y], [x + w, y], [x + w, y + h], [x, y + h]])
-
     def process(self):
         """Основной цикл обработки."""
         polygon = self.polygon
