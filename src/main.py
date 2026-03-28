@@ -14,6 +14,7 @@ import numpy as np
 import cv2
 import argparse
 from ultralytics import YOLO
+import json
 
 OUTPUT_DIR = "outputs"
 
@@ -290,20 +291,104 @@ class TableMonitor:
 
 
 # -----------------------------------------------------------------------
-# 
+#  ROIManager
 # -----------------------------------------------------------------------
+class ROIManager:
+    """
+    Класс для управления зонами интереса (ROI).
+    Автоматически создает папки и привязывает ROI к конкретным именам файлов.
+    """
+    def __init__(self, config_path: str = "settings/table_config.json"):
+        self.config_path = config_path
+        # Обойти ошибку несуществующей папки:
+        self._ensure_dir()
 
+    def _ensure_dir(self):
+        """Создает папку для конфига, если её нет."""
+        dir_name = os.path.dirname(self.config_path)
+        if dir_name and not os.path.exists(dir_name):
+            os.makedirs(dir_name, exist_ok=True)
+            print(f"[INFO] Создана директория: {dir_name}")
+
+    def get_roi(self, video_path: str) -> np.ndarray:
+        """
+        Загружает ROI для конкретного файла. 
+        Если файл новый — просит выбрать зону.
+        """
+        # Используем только имя файла как ключ (чтобы пути /home/user/... не мешали)
+        file_key = os.path.basename(video_path)
+        
+        all_configs = self._load_all_configs()
+        
+        if file_key in all_configs:
+            print(f"[INFO] Найден сохраненный ROI для файла: {file_key}")
+            roi = all_configs[file_key]
+        else:
+            print(f"[WARN] ROI для '{file_key}' не найден. Требуется настройка.")
+            roi = self._select_interactively(video_path)
+            self._save_config(file_key, roi)
+
+        # Превращаем [x, y, w, h] в полигон
+        x, y, w, h = roi
+        return np.array([[x, y], [x + w, y], [x + w, y + h], [x, y + h]])
+
+    def _load_all_configs(self) -> dict:
+        """Грузит весь JSON файл."""
+        if os.path.exists(self.config_path):
+            try:
+                with open(self.config_path, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except Exception as e:
+                print(f"[ERROR] Ошибка чтения конфига: {e}")
+        return {}
+
+    def _save_config(self, file_key: str, roi: list):
+        """Добавляет новый ROI в файл, не стирая старые."""
+        configs = self._load_all_configs()
+        configs[file_key] = roi
+        
+        with open(self.config_path, 'w', encoding='utf-8') as f:
+            json.dump(configs, f, indent=4, ensure_ascii=False)
+        print(f"[SUCCESS] Настройки для {file_key} сохранены.")
+
+    def _select_interactively(self, video_path: str) -> list:
+        cap = cv2.VideoCapture(video_path)
+        ret, frame = cap.read()
+        cap.release()
+        
+        if not ret:
+            raise ValueError(f"Не удалось открыть видео: {video_path}")
+            
+        window_name = f"Select ROI for: {os.path.basename(video_path)}"
+        roi = cv2.selectROI(window_name, frame, fromCenter=False)
+        cv2.destroyWindow(window_name)
+        for _ in range(10): cv2.waitKey(1)
+        
+        x, y, w, h = roi
+        if w == 0 or h == 0:
+            # Fallback: весь кадр, если пользователь нажал Esc
+            h_f, w_f = frame.shape[:2]
+            return [0, 0, w_f, h_f]
+            
+        return [int(x), int(y), int(w), int(h)]
+
+
+# -----------------------------------------------------------------------
+#  VideoProcessor
+# -----------------------------------------------------------------------
 class VideoProcessor:
     def __init__(
         self, 
         video_path: str, 
         monitor: TableMonitor, 
+        polygon: np.ndarray,
         model_variant: str = "yolov8n.pt",
         show_view: bool = True
     ):
         self.video_path = video_path
         self.monitor = monitor
         self.show_view = show_view
+        self.polygon = polygon
         
         # Инициализация детектора
         self.model = YOLO(model_variant)
@@ -352,7 +437,7 @@ class VideoProcessor:
 
     def process(self):
         """Основной цикл обработки."""
-        polygon = self._get_roi()
+        polygon = self.polygon
         frame_no = 0
 
         print(f"Обработка началась (Визуализация: {'ВКЛ' if self.show_view else 'ВЫКЛ'})...")
@@ -420,20 +505,25 @@ def main():
     parser.add_argument("--headless", action="store_true", help="Запустить без отображения окна")
     args = parser.parse_args()
 
-    # 1. Инициализируем бизнес-логику
+    # 1. Получаем ROI
+    roi_helper = ROIManager()
+    table_polygon = roi_helper.get_roi(args.video)
+
+    # 2. Инициализируем бизнес-логику
     # Дебаунс: 30 кадров (~1 сек) для пустоты, 5 кадров для появления
     monitor = TableMonitor(min_empty_frames=30, min_occupied_frames=5)
 
-    # 2. Запускаем процессор
+    # 3. Запускаем процессор
     processor = VideoProcessor(
         video_path=args.video, 
-        monitor=monitor, 
+        monitor=monitor,
+        polygon=table_polygon,
         show_view=not args.headless
     )
     
     processor.process()
 
-    # 3. Формирование отчета (Требование 2 из ТЗ)
+    # 4. Формирование отчета (Требование 2 из ТЗ)
     print("\n" + "="*30)
     print("ИТОГОВЫЙ ОТЧЕТ")
     print("="*30)
