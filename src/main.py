@@ -86,8 +86,8 @@ class TableMonitor:
 
     def __init__(
         self,
-        min_empty_frames:    int = 30,   # ~1 сек при 30fps
-        min_occupied_frames: int = 5,    # ~0.17 сек — быстрее реагируем на появление
+        min_empty_frames:    int = 60,   # ~2 сек при 30fps
+        min_occupied_frames: int = 30,    # ~1 сек — быстрее реагируем на появление
     ):
         self.min_empty_frames    = min_empty_frames
         self.min_occupied_frames = min_occupied_frames
@@ -230,6 +230,25 @@ class TableMonitor:
                 "is_completed":      c in self._closed_cycles,
             }
             for c in all_cycles
+        ])
+    
+    def get_state_history_dataframe(self, fps: float) -> pd.DataFrame:
+        """
+        Возвращает полную посекундную историю состояний столика.
+        
+        Args:
+            fps: частота кадров видео для расчета таймстемпов.
+        """
+        if not self.state_history:
+            return pd.DataFrame(columns=["frame_no", "timestamp_sec", "state"])
+
+        return pd.DataFrame([
+            {
+                "frame_no":      i,
+                "timestamp_sec": round(i / fps, 3),
+                "state":         s.name
+            }
+            for i, s in enumerate(self.state_history)
         ])
 
     # -----------------------------------------------------------------------
@@ -588,6 +607,7 @@ def main():
     analytics = monitor.get_analytics()
     df_events = monitor.get_events_dataframe()
     df_cycles = monitor.get_cycles_dataframe()
+    df_state_history = monitor.get_state_history_dataframe()
 
     print(f"Всего циклов (уход-приход): {analytics['total_cycles']}")
     if analytics['mean_response_sec']:
@@ -598,6 +618,8 @@ def main():
     # Сохранение в CSV (Требование ТЗ)
     df_events.to_csv(f"{OUTPUT_DIR}/events_log.csv", index=False)
     df_cycles.to_csv(f"{OUTPUT_DIR}/cleanup_analytics.csv", index=False)
+    df_state_history.to_csv(f"{OUTPUT_DIR}/state_history.csv", index=False)
+    
     print("\nДетальные логи сохранены в 'events_log.csv' и 'cleanup_analytics.csv'")
 
 if __name__ == "__main__":
