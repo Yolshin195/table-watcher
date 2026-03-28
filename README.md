@@ -20,44 +20,36 @@ EMPTY ──► APPROACH ──► OCCUPIED ──► EMPTY ──► ...
 ```mermaid
 graph TD
     %% Определение стилей для состояний
-    classDef state fill:#fff,stroke:#333,stroke-width:2px,rx:10,ry:10;
-    classDef empty fill:#d4edda,stroke:#155724,stroke-width:2px,rx:10,ry:10,color:#155724;
-    classDef approach fill:#fff3cd,stroke:#856404,stroke-width:2px,rx:10,ry:10,color:#856404;
-    classDef occupied fill:#f8d7da,stroke:#721c24,stroke-width:2px,rx:10,ry:10,color:#721c24;
+    classDef empty fill:#d4edda,stroke:#155724,stroke-width:2px,color:#155724;
+    classDef approach fill:#fff3cd,stroke:#856404,stroke-width:2px,color:#856404;
+    classDef occupied fill:#f8d7da,stroke:#721c24,stroke-width:2px,color:#721c24;
 
     %% Начальная точка
     Start(( )) -->|Запуск системы| EMPTY;
 
     %% Состояния
-    EMPTY[<b>EMPTY</b><br/>(Пусто)<br/>Рамка: Зеленая]:::empty
-    APPROACH[<b>APPROACH</b><br/>(Подход)<br/>Рамка: Желтая]:::approach
-    OCCUPIED[<b>OCCUPIED</b><br/>(Занято)<br/>Рамка: Красная]:::occupied
+    EMPTY["<b>EMPTY</b><br/>(Пусто)<br/>Рамка: Зеленая"]:::empty
+    APPROACH["<b>APPROACH</b><br/>(Подход)<br/>Рамка: Желтая"]:::approach
+    OCCUPIED["<b>OCCUPIED</b><br/>(Занято)<br/>Рамка: Красная"]:::occupied
 
     %% Переходы
     
     %% 1. Из EMPTY в APPROACH
-    EMPTY -->|Человек в ROI<br/>[стабильно > 5 кадров]| APPROACH;
-    
-    %% Действия при переходе EMPTY -> APPROACH
-    linkStyle 1 stroke-width:2px,fill:none,stroke:#856404;
+    EMPTY -->|"Человек в ROI<br/>[стабильно > 5 кадров]"| APPROACH;
     
     %% Добавляем подпись к действию аналитики
-    EMPTY -.->|<b>/ АНАЛИТИКА:</b><br/>1. Остановить секундомер<br/>2. Рассчитать время реакции<br/>3. Записать APPROACH в лог| APPROACH;
-    linkStyle 2 stroke-width:1px,stroke-dasharray: 5 5,stroke:#856404;
+    EMPTY -.->|"<b>/ АНАЛИТИКА:</b><br/>1. Остановить секундомер<br/>2. Рассчитать время реакции<br/>3. Записать APPROACH в лог"| APPROACH;
 
     %% 2. Из APPROACH в OCCUPIED
-    APPROACH -->|Человек остался<br/>[на следующем кадре]| OCCUPIED;
-    linkStyle 3 stroke-width:2px,fill:none,stroke:#721c24;
+    APPROACH -->|"Человек остался<br/>[на следующем кадре]"| OCCUPIED;
 
     %% 3. Из OCCUPIED в EMPTY
-    OCCUPIED -->|ROI пуст<br/>[стабильно > 30 кадров]| EMPTY;
-    linkStyle 4 stroke-width:2px,fill:none,stroke:#155724;
+    OCCUPIED -->|"ROI пуст<br/>[стабильно > 30 кадров]"| EMPTY;
 
     %% Действия при переходе OCCUPIED -> EMPTY
-    OCCUPIED -.->|<b>/ АНАЛИТИКА:</b><br/>1. Запустить секундомер<br/>2. Открыть новый CleanupRecord<br/>3. Записать EMPTY в лог| EMPTY;
-    linkStyle 5 stroke-width:1px,stroke-dasharray: 5 5,stroke:#155724;
+    OCCUPIED -.->|"<b>/ АНАЛИТИКА:</b><br/>1. Запустить секундомер<br/>2. Открыть новый CleanupRecord<br/>3. Записать EMPTY в лог"| EMPTY;
 
     %% Петли (удержание состояния)
-    EMPTY -->|ROI пуст| EMPTY;
-    OCCUPIED -->|Человек в ROI| OCCUPIED;
+    EMPTY -->|"ROI пуст"| EMPTY;
+    OCCUPIED -->|"Человек в ROI"| OCCUPIED;
 ```
