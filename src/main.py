@@ -232,7 +232,7 @@ class TableMonitor:
             for c in all_cycles
         ])
     
-    def get_state_history_dataframe(self, fps: float) -> pd.DataFrame:
+    def get_state_history_dataframe(self, fps: float = 30) -> pd.DataFrame:
         """
         Возвращает полную посекундную историю состояний столика.
         
@@ -297,6 +297,15 @@ class TableMonitor:
         self._state = t.next_state
         self._transitions.append(t)
 
+        # -------------------------------------------------------------------
+        # ДОБАВЛЯЕМ: Сброс счетчиков дебаунса.
+        # Это критически важно! Если не обнулить, то после APPROACH (на 5-м кадре)
+        # на 6-м кадре счетчик станет 6, и система МГНОВЕННО перейдет в OCCUPIED,
+        # не дав дебаунсу отработать заново для подтверждения стабильности.
+        # -------------------------------------------------------------------
+        self._consecutive_empty = 0
+        self._consecutive_occupied = 0
+
         # Стол освободился — открываем новый цикл ожидания
         if t.next_state == TableState.EMPTY:
             self._open_cycles.append(CleanupRecord(
@@ -311,9 +320,16 @@ class TableMonitor:
             cycle.approach_at_sec   = t.timestamp
             self._closed_cycles.append(cycle)
 
-        # После APPROACH следующий переход — обычный OCCUPIED (не APPROACH снова)
-        if t.next_state == TableState.APPROACH:
-            self._state = TableState.OCCUPIED
+        # -------------------------------------------------------------------
+        # УДАЛЯЕМ:
+        # if t.next_state == TableState.APPROACH:
+        #     self._state = TableState.OCCUPIED
+        # -------------------------------------------------------------------
+        # ПОЧЕМУ УДАЛЯЕМ: Эта строка принудительно меняла состояние "втихую".
+        # Из-за этого в историю (self._transitions) никогда не попадало событие 
+        # перехода в OCCUPIED после подхода. Теперь система сама увидит человека 
+        # на следующем кадре и создаст ЧЕСТНЫЙ переход через метод update().
+        # -------------------------------------------------------------------   
 
 
 # -----------------------------------------------------------------------

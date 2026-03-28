@@ -530,3 +530,124 @@ class TestMultipleCycles:
         a = m.get_analytics()
         df = m.get_cycles_dataframe()
         assert len(df) == a["completed_cycles"] + a["open_cycles"]
+
+
+# ---------------------------------------------------------------------------
+# Группа 8: Специфические краевые случаи FSM (Выявление багов)
+# ---------------------------------------------------------------------------
+
+class TestFSMEdgeCases:
+
+    def test_transition_chain_is_complete(self):
+        """
+        ПРОВЕРКА НА БАГ: После APPROACH обязательно должно быть событие OCCUPIED.
+        Если в коде стоит ручная перезапись self._state = OCCUPIED внутри 
+        обработки APPROACH, то второе событие (переход в стабильное состояние) 
+        просто не сгенерируется, так как update() не увидит разницы.
+        """
+        m = make_monitor(empty=3, occupied=2)
+        
+        # Подаем 5 кадров присутствия. 
+        # На 2-м кадре должен быть APPROACH.
+        # На 3-м (или сразу после) должен быть переход в стабильный OCCUPIED.
+        feed(m, True, 5) 
+        
+        events = [t.next_state for t in m.transitions]
+        
+        # В дефектной версии здесь будет только [TableState.APPROACH]
+        assert len(events) >= 2, f"Цепочка событий прервана: {events}"
+        assert TableState.OCCUPIED in events, "Отсутствует подтверждение состояния OCCUPIED в истории"
+
+    def test_no_dead_zone_after_approach(self):
+        """
+        Проверка сброса счетчиков. Если после фиксации APPROACH человек сразу 
+        исчезает, система должна корректно начать отсчет до EMPTY.
+        """
+        m = make_monitor(empty=3, occupied=2)
+        
+        # 1. Фиксируем подход (кадры 0, 1)
+        feed(m, True, 2) 
+        assert m.state == TableState.OCCUPIED
+        
+        # 2. Человек уходит (кадры 2, 3, 4). На 4-м кадре должен быть EMPTY.
+        transitions = feed(m, False, 3, start_frame=2)
+        
+        assert m.state == TableState.EMPTY
+        assert any(t.next_state == TableState.EMPTY for t in transitions), \
+            "Система 'зависла' в OCCUPIED и не заметила ухода сразу после подхода"
+
+    def test_approach_is_atomic_event(self):
+        """
+        APPROACH не должен генерироваться повторно, если стол не стал EMPTY.
+        Это проверяет, что APPROACH — это именно 'вход' в состояние занятости.
+        """
+        m = make_monitor(empty=10, occupied=2)
+        
+        # Занимаем стол -> APPROACH
+        feed(m, True, 2) 
+        
+        # Кратковременный 'дребезг' детектора (исчез на 3 кадра, порог EMPTY = 10)
+        feed(m, False, 3, start_frame=10) 
+        
+        # Снова появился
+        transitions = feed(m, True, 2, start_frame=13)
+        
+        # Новых APPROACH быть не должно
+        approaches = [t for t in transitions if t.next_state == TableState.APPROACH]
+        assert len(approaches) == 0, "Ошибка: Повторный APPROACH без предварительной очистки стола"
+
+
+# ---------------------------------------------------------------------------
+# Группа 9: Проверка инерции счетчиков (Debounce Integrity)
+# ---------------------------------------------------------------------------
+
+class TestDebounceIntegrity:
+
+    def test_occupied_confirmation_requires_new_frames_after_approach(self):
+        """
+        ТЕСТ НА ОШИБКУ: После APPROACH система должна ПОВТОРНО подтвердить 
+        стабильность состояния для перехода в OCCUPIED.
+        
+        Если счетчики не сбрасываются в _apply_transition, то при 
+        min_occupied_frames=5:
+        - Кадр 5: APPROACH (счетчик=5)
+        - Кадр 6: OCCUPIED (счетчик=6) -> ОШИБКА, переход случился слишком быстро.
+        """
+        threshold = 5
+        m = make_monitor(empty=10, occupied=threshold)
+        
+        # 1. Подаем ровно столько кадров, сколько нужно для APPROACH
+        feed(m, True, threshold)
+        assert m.state == TableState.OCCUPIED # Внутри уже подменилось
+        
+        # Проверяем историю переходов
+        events = m.transitions
+        assert events[-1].next_state == TableState.APPROACH
+        
+        # 2. Подаем ЕЩЕ ОДИН кадр присутствия
+        m.update(threshold + 1, FPS, True)
+        
+        # Если счетчик НЕ сбросился, система увидит (threshold + 1) > threshold
+        # и создаст новый переход в OCCUPIED прямо сейчас.
+        
+        all_next_states = [t.next_state for t in m.transitions]
+        
+        # ПРОВЕРКА: В списке событий НЕ должно быть OCCUPIED сразу после APPROACH.
+        # Мы должны накопить еще 'threshold' кадров для этого.
+        assert TableState.OCCUPIED not in all_next_states, (
+            f"БАГ: Переход в OCCUPIED случился мгновенно на кадре {threshold + 1}. "
+            "Счетчики не были сброшены после APPROACH."
+        )
+
+    def test_counter_reset_after_any_transition(self):
+        """
+        Тест проверяет физическое обнуление атрибутов после перехода.
+        """
+        m = make_monitor(empty=5, occupied=5)
+        
+        # Доводим до перехода
+        feed(m, True, 5)
+        
+        assert m._consecutive_occupied == 0, (
+            f"Счетчик _consecutive_occupied равен {m._consecutive_occupied}, а должен быть 0"
+        )
