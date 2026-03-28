@@ -108,6 +108,9 @@ class TableMonitor:
         # --- Закрытые циклы (есть и empty_at, и approach_at) ---
         self._closed_cycles: list[CleanupRecord] = []
 
+        # --- Полная история
+        self.state_history: list[TableState] = []
+
     # -----------------------------------------------------------------------
     # Публичный API
     # -----------------------------------------------------------------------
@@ -144,6 +147,10 @@ class TableMonitor:
             self._consecutive_occupied = 0
 
         transition = self._try_transition(frame_no, timestamp, occupied)
+
+        # Сохраняем текущее состояние в историю после всех расчетов
+        self.state_history.append(self._state)
+
         return transition
 
     def get_analytics(self) -> dict:
@@ -374,6 +381,58 @@ class ROIManager:
 
 
 # -----------------------------------------------------------------------
+#  TableUI
+# -----------------------------------------------------------------------
+class TableUI:
+    """Класс для централизованной отрисовки интерфейса."""
+    def __init__(self, polygon: np.ndarray):
+        self.polygon = polygon
+        # Единая палитра цветов
+        self.colors = {
+            TableState.EMPTY: (0, 255, 0),      # Зеленый
+            TableState.OCCUPIED: (0, 0, 255),   # Красный
+            TableState.APPROACH: (0, 255, 255), # Желтый (подход)
+        }
+
+    def draw_all(self, frame: np.ndarray, state: TableState, people: list, history: list, total_frames: int):
+        """Рисует все слои: ROI, людей и таймлайн."""
+        current_color = self.colors.get(state, (255, 255, 255))
+
+        # 1. Рисуем людей
+        for person in people:
+            color = (0, 0, 255) if person["in_roi"] else (255, 0, 0)
+            x1, y1, x2, y2 = person["box"]
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+            cv2.circle(frame, person["point"], 5, color, -1)
+
+        # 2. Рисуем ROI (цветом текущего состояния)
+        cv2.polylines(frame, [self.polygon], isClosed=True, color=current_color, thickness=2)
+        cv2.putText(frame, f"Status: {state.name}", (self.polygon[0][0], self.polygon[0][1] - 10), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, current_color, 2)
+
+        # 3. Рисуем таймлайн поверх видео снизу
+        self._draw_timeline(frame, history, total_frames)
+
+    def _draw_timeline(self, frame: np.ndarray, history: list, total_frames: int):
+        """Рисует заполняющуюся полоску внизу кадра."""
+        h, w = frame.shape[:2]
+        bar_h = 15  # Высота полоски в пикселях
+        
+        if total_frames <= 0: return
+
+        # Масштаб: сколько пикселей занимает один кадр
+        step = w / total_frames
+        
+        # Отрисовка накопленной истории
+        for i, s in enumerate(history):
+            x_start = int(i * step)
+            x_end = int((i + 1) * step)
+            color = self.colors.get(s, (100, 100, 100))
+            # Рисуем маленький прямоугольник для этого кадра
+            cv2.rectangle(frame, (x_start, h - bar_h), (x_end, h), color, -1)
+
+
+# -----------------------------------------------------------------------
 #  VideoProcessor
 # -----------------------------------------------------------------------
 class VideoProcessor:
@@ -405,6 +464,9 @@ class VideoProcessor:
         # Настройка записи результата (output.mp4)
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         self.out = cv2.VideoWriter(f'{OUTPUT_DIR}/output.mp4', fourcc, self.fps, (self.width, self.height))
+
+        self.ui = TableUI(polygon)
+        self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
     def process(self):
         """Основной цикл обработки."""
@@ -463,41 +525,23 @@ class VideoProcessor:
         return is_occupied_now, detected_people
 
     def _handle_output(self, frame, current_state, detected_people):
-        """Рисует полигон, боксы людей и точки входа."""
-        # 1. Рисуем всех обнаруженных людей
-        for person in detected_people:
-            # Если человек в зоне — красный, если нет — синий (или любой другой)
-            color = (0, 0, 255) if person["in_roi"] else (255, 0, 0)
-            
-            # Рисуем Bounding Box
-            x1, y1, x2, y2 = person["box"]
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-            
-            # Рисуем точку, по которой считаем вход в зону
-            cv2.circle(frame, person["point"], 5, color, -1)
-
-        # 2. Рисуем основной полигон зоны
-        poly_color = (0, 255, 0) if current_state == TableState.EMPTY else (0, 0, 255)
-        cv2.polylines(frame, [self.polygon], isClosed=True, color=poly_color, thickness=2)
+        """Вызывает отрисовку всех слоев интерфейса."""
         
-        # 3. Текст состояния
-        label = f"Status: {current_state.name}"
-        cv2.putText(frame, label, (self.polygon[0][0], self.polygon[0][1] - 10), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, poly_color, 2)
+        # Используем новый UI менеджер вместо старых cv2.rectangle внутри
+        self.ui.draw_all(
+            frame, 
+            current_state, 
+            detected_people, 
+            self.monitor.state_history, 
+            self.total_frames
+        )
 
         self.out.write(frame)
 
         if self.show_view:
             cv2.imshow("Monitoring", frame)
-            # waitKey ОБЯЗАТЕЛЕН для обновления окна, даже если нам не важна кнопка
             key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
-                return True
-        else:
-            # В headless-режиме waitKey не нужен для окна, 
-            # но иногда полезен для прерывания в консоли (хотя тут лучше Ctrl+C)
-            pass
-            
+            return key == ord('q')
         return False
 
     def _check_exit_key(self):
