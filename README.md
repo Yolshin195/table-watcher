@@ -16,3 +16,48 @@ EMPTY ──► APPROACH ──► OCCUPIED ──► EMPTY ──► ...
 Прямой переход из сигнала детектора в состояние не делается — между ними стоит дебаунс: состояние меняется только если детектор стабильно показывает одно и то же на протяжении `N` кадров подряд. Это защищает от мерцания модели при движении или перекрытии. Состояние `APPROACH` — особое: оно фиксируется исключительно при первом появлении человека после подтверждённого `EMPTY`, именно его временна́я метка используется как момент «подхода к столу».
 
 **Аналитика.** Каждый переход состояния записывается с временно́й меткой в Pandas DataFrame. По парам событий `EMPTY → APPROACH` вычисляется время реакции для каждого цикла. Итоговая метрика — среднее, медиана, минимум и максимум времени между уходом гостей и первым подходом к столу.
+
+```mermaid
+graph TD
+    %% Определение стилей для состояний
+    classDef state fill:#fff,stroke:#333,stroke-width:2px,rx:10,ry:10;
+    classDef empty fill:#d4edda,stroke:#155724,stroke-width:2px,rx:10,ry:10,color:#155724;
+    classDef approach fill:#fff3cd,stroke:#856404,stroke-width:2px,rx:10,ry:10,color:#856404;
+    classDef occupied fill:#f8d7da,stroke:#721c24,stroke-width:2px,rx:10,ry:10,color:#721c24;
+
+    %% Начальная точка
+    Start(( )) -->|Запуск системы| EMPTY;
+
+    %% Состояния
+    EMPTY[<b>EMPTY</b><br/>(Пусто)<br/>Рамка: Зеленая]:::empty
+    APPROACH[<b>APPROACH</b><br/>(Подход)<br/>Рамка: Желтая]:::approach
+    OCCUPIED[<b>OCCUPIED</b><br/>(Занято)<br/>Рамка: Красная]:::occupied
+
+    %% Переходы
+    
+    %% 1. Из EMPTY в APPROACH
+    EMPTY -->|Человек в ROI<br/>[стабильно > 5 кадров]| APPROACH;
+    
+    %% Действия при переходе EMPTY -> APPROACH
+    linkStyle 1 stroke-width:2px,fill:none,stroke:#856404;
+    
+    %% Добавляем подпись к действию аналитики
+    EMPTY -.->|<b>/ АНАЛИТИКА:</b><br/>1. Остановить секундомер<br/>2. Рассчитать время реакции<br/>3. Записать APPROACH в лог| APPROACH;
+    linkStyle 2 stroke-width:1px,stroke-dasharray: 5 5,stroke:#856404;
+
+    %% 2. Из APPROACH в OCCUPIED
+    APPROACH -->|Человек остался<br/>[на следующем кадре]| OCCUPIED;
+    linkStyle 3 stroke-width:2px,fill:none,stroke:#721c24;
+
+    %% 3. Из OCCUPIED в EMPTY
+    OCCUPIED -->|ROI пуст<br/>[стабильно > 30 кадров]| EMPTY;
+    linkStyle 4 stroke-width:2px,fill:none,stroke:#155724;
+
+    %% Действия при переходе OCCUPIED -> EMPTY
+    OCCUPIED -.->|<b>/ АНАЛИТИКА:</b><br/>1. Запустить секундомер<br/>2. Открыть новый CleanupRecord<br/>3. Записать EMPTY в лог| EMPTY;
+    linkStyle 5 stroke-width:1px,stroke-dasharray: 5 5,stroke:#155724;
+
+    %% Петли (удержание состояния)
+    EMPTY -->|ROI пуст| EMPTY;
+    OCCUPIED -->|Человек в ROI| OCCUPIED;
+```
