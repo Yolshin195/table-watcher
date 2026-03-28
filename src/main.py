@@ -5,7 +5,7 @@
 На вход принимает только: номер кадра + bool "есть ли человек в зоне".
 Вся логика FSM, дебаунс, аналитика — здесь.
 """
-
+import os
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Optional
@@ -15,6 +15,7 @@ import cv2
 import argparse
 from ultralytics import YOLO
 
+OUTPUT_DIR = "outputs"
 
 # ---------------------------------------------------------------------------
 # Типы данных
@@ -318,7 +319,7 @@ class VideoProcessor:
         
         # Настройка записи результата (output.mp4)
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        self.out = cv2.VideoWriter('output.mp4', fourcc, self.fps, (self.width, self.height))
+        self.out = cv2.VideoWriter(f'{OUTPUT_DIR}/output.mp4', fourcc, self.fps, (self.width, self.height))
 
     def _get_roi(self) -> np.ndarray:
         """Интерактивный выбор зоны столика."""
@@ -412,6 +413,8 @@ class VideoProcessor:
 
 
 def main():
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
     parser = argparse.ArgumentParser(description="Table Cleaning Detection Prototype")
     parser.add_argument("--video", type=str, required=True, help="Путь к видеофайлу")
     parser.add_argument("--headless", action="store_true", help="Запустить без отображения окна")
@@ -446,8 +449,8 @@ def main():
         print("Недостаточно данных для расчета среднего времени (никто не подошел к пустому столу).")
 
     # Сохранение в CSV (Требование ТЗ)
-    df_events.to_csv("events_log.csv", index=False)
-    df_cycles.to_csv("cleanup_analytics.csv", index=False)
+    df_events.to_csv(f"{OUTPUT_DIR}/events_log.csv", index=False)
+    df_cycles.to_csv(f"{OUTPUT_DIR}/cleanup_analytics.csv", index=False)
     print("\nДетальные логи сохранены в 'events_log.csv' и 'cleanup_analytics.csv'")
 
 if __name__ == "__main__":

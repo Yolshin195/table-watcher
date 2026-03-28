@@ -214,3 +214,6 @@ videos/
 
 # Модель Yolov
 yolov*.pt
+
+# Папка с результатами работы
+outputs/
