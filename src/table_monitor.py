@@ -180,13 +180,6 @@ class _EmptyState(_BaseTableState):
     def tag(self) -> TableState:
         return TableState.EMPTY
 
-    # ToDo: Удалить после проверки работы нового метода
-    # def on_enter(self, ctx: _MonitorContext, frame_no: int, timestamp: float) -> None:
-    #     ctx.open_cycles.append(CleanupRecord(
-    #         empty_at_frame=frame_no,
-    #         empty_at_sec=timestamp,
-    #     ))
-    
     def on_enter(self, ctx: _MonitorContext, frame_no: int, timestamp: float) -> None:
         # Если это самый старт (нет переходов) ИЛИ мы пришли из OCCUPIED
         is_startup = not ctx.transitions
@@ -330,7 +323,7 @@ class TableMonitor:
 
     def __init__(
         self,
-        min_empty_frames:    int = 90,
+        min_empty_frames:    int = 200,
         min_occupied_frames: int = 15,
         min_stay_frames:     int = 150,
     ):

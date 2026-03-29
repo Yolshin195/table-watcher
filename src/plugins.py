@@ -447,7 +447,7 @@ class TimelinePlugin(BasePlugin):
     Цвет полоски соответствует состоянию стола в конкретный момент времени.
     """
 
-    def __init__(self, bar_height: int = 15):
+    def __init__(self, bar_height: int = 35):
         self.bar_height = bar_height
         self._total_frames: int = 0
         # Храним историю состояний для отрисовки всей полоски на каждом кадре

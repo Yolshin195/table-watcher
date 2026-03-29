@@ -129,21 +129,32 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--empty-frames",
         type=int,
-        default=30,
+        default=200,
         metavar="N",
         help=(
-            "Сколько кадров подряд зона должна быть пустой, "
-            "чтобы зафиксировать событие EMPTY (default: 30 ≈ 1 сек при 30fps)."
+            "Порог очистки: сколько кадров подряд в зоне не должно быть людей, "
+            "чтобы стол перешел в состояние EMPTY (защита от мерцания детектора)."
         ),
     )
     parser.add_argument(
         "--occupied-frames",
         type=int,
-        default=5,
+        default=15,
         metavar="N",
         help=(
-            "Сколько кадров подряд в зоне должен быть человек, "
-            "чтобы зафиксировать событие OCCUPIED (default: 5)."
+            "Порог фиксации подхода: сколько кадров присутствия нужно, чтобы "
+            "перейти из EMPTY в APPROACH и начать наблюдение за потенциальным гостем."
+        ),
+    )
+    parser.add_argument(
+        "--stay-frames",
+        type=int,
+        default=150,
+        metavar="N",
+        help=(
+            "Порог подтверждения посадки: сколько кадров человек должен "
+            "непрерывно находиться в зоне APPROACH, чтобы система зафиксировала "
+            "состояние OCCUPIED и закрыла аналитический цикл ожидания."
         ),
     )
 
@@ -215,6 +226,10 @@ def _validate(args: argparse.Namespace) -> None:
     if args.occupied_frames < 1:
         print(f"Ошибка: --occupied-frames должен быть >= 1", file=sys.stderr)
         sys.exit(1)
+    
+    if args.stay_frames < 1:
+        print(f"Ошибка: --stay_frames должен быть >= 1", file=sys.stderr)
+        sys.exit(1)        
 
 
 # ---------------------------------------------------------------------------
@@ -291,6 +306,7 @@ def main() -> None:
     monitor = TableMonitor(
         min_empty_frames=args.empty_frames,
         min_occupied_frames=args.occupied_frames,
+        min_stay_frames=args.stay_frames,
     )
 
     plugins = _build_plugins(args)
@@ -300,8 +316,8 @@ def main() -> None:
 
     log.info("Видео:   %s", args.video)
     log.info("Модель:  %s  (confidence=%.2f  step=%d)", args.model, args.confidence, args.step)
-    log.info("FSM:     empty_frames=%d  occupied_frames=%d",
-             args.empty_frames, args.occupied_frames)
+    log.info("FSM:     empty_frames=%d  occupied_frames=%d, stay_frames=%d",
+             args.empty_frames, args.occupied_frames, args.stay_frames)
 
     # 2. Логика определения ROI
     if args.roi:
