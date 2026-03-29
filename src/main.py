@@ -227,6 +227,8 @@ def _build_plugins(args: argparse.Namespace) -> list:
         SnapshotPlugin,
         ReportPlugin,
         TimelinePlugin,
+        TimelineChartPlugin,
+        PeopleVisualizerPlugin,
     )
 
     plugins = []
@@ -234,6 +236,7 @@ def _build_plugins(args: argparse.Namespace) -> list:
     # Overlay рисуется только если не фоновый режим
     if not args.no_overlay:
         plugins.append(RoiOverlayPlugin())
+        plugins.append(PeopleVisualizerPlugin())
         plugins.append(TimelinePlugin())
 
     # Live-просмотр — подключается ПОСЛЕ overlay, чтобы видеть отрисовку
@@ -257,6 +260,9 @@ def _build_plugins(args: argparse.Namespace) -> list:
         output_path=args.report,
         video_path=args.video,
     ))
+
+    # Генерации финального аналитического графика.
+    plugins.append(TimelineChartPlugin())
 
     return plugins
 

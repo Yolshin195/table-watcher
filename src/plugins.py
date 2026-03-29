@@ -23,8 +23,9 @@ from typing import Optional
 
 import cv2
 import numpy as np
+import matplotlib.pyplot as plt
 
-from table_monitor import TableMonitor, TableState, StateTransition
+from table_monitor import TableMonitor, TableState
 from video_processor import BasePlugin, FrameContext
 
 logger = logging.getLogger(__name__)
@@ -97,7 +98,35 @@ class RoiOverlayPlugin(BasePlugin):
 
 
 # ---------------------------------------------------------------------------
-# 2. EventLoggerPlugin — логирует каждое событие FSM в консоль
+# 2. PeopleVisualizerPlugin — Рисует рамки и точки детекции, используя PersonDetection
+# ---------------------------------------------------------------------------
+class PeopleVisualizerPlugin(BasePlugin):
+    """Рисует рамки и точки детекции, используя PersonDetection."""
+
+    def on_frame(self, ctx: FrameContext) -> None:
+        for person in ctx.detected_people:
+            x1, y1, x2, y2 = person.bbox
+            
+            # Красный для тех, кто в ROI, Зеленый для остальных
+            color = (0, 0, 255) if person.is_in_roi else (0, 255, 0)
+            thickness = 2 if person.is_in_roi else 1
+
+            # Отрисовка BBox
+            cv2.rectangle(ctx.frame, (x1, y1), (x2, y2), color, thickness)
+            
+            # Отрисовка "точки опоры" (ног)
+            cv2.circle(ctx.frame, person.foot_point, 4, color, -1)
+            
+            # Подпись уверенности
+            label = f"{person.confidence:.2f}"
+            cv2.putText(
+                ctx.frame, label, (x1, y1 - 5),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA
+            )
+
+
+# ---------------------------------------------------------------------------
+# 3. EventLoggerPlugin — логирует каждое событие FSM в консоль
 # ---------------------------------------------------------------------------
 
 class EventLoggerPlugin(BasePlugin):
@@ -154,7 +183,7 @@ class EventLoggerPlugin(BasePlugin):
 
 
 # ---------------------------------------------------------------------------
-# 3. ProgressPlugin — прогресс-бар в консоли
+# 4. ProgressPlugin — прогресс-бар в консоли
 # ---------------------------------------------------------------------------
 
 class ProgressPlugin(BasePlugin):
@@ -200,7 +229,7 @@ class ProgressPlugin(BasePlugin):
 
 
 # ---------------------------------------------------------------------------
-# 4. SnapshotPlugin — сохраняет кадр при каждой смене состояния
+# 5. SnapshotPlugin — сохраняет кадр при каждой смене состояния
 # ---------------------------------------------------------------------------
 
 class SnapshotPlugin(BasePlugin):
@@ -232,7 +261,7 @@ class SnapshotPlugin(BasePlugin):
 
 
 # ---------------------------------------------------------------------------
-# 5. ReportPlugin — записывает текстовый отчёт после обработки
+#6. ReportPlugin — записывает текстовый отчёт после обработки
 # ---------------------------------------------------------------------------
 
 class ReportPlugin(BasePlugin):
@@ -329,7 +358,7 @@ class ReportPlugin(BasePlugin):
 
 
 # ---------------------------------------------------------------------------
-# 6. LiveViewPlugin — показывает кадры в окне cv2.imshow в реальном времени
+# 7. LiveViewPlugin — показывает кадры в окне cv2.imshow в реальном времени
 # ---------------------------------------------------------------------------
  
 class LiveViewPlugin(BasePlugin):
@@ -410,7 +439,7 @@ class LiveViewPlugin(BasePlugin):
 
 
 # ---------------------------------------------------------------------------
-# 7. TimelinePlugin — отрисовывает историю состояний внизу кадра
+# 8. TimelinePlugin — отрисовывает историю состояний внизу кадра
 # ---------------------------------------------------------------------------
 class TimelinePlugin(BasePlugin):
     """
@@ -472,3 +501,97 @@ class TimelinePlugin(BasePlugin):
     def on_finish(self, monitor: TableMonitor) -> None:
         # Очищаем историю после завершения, чтобы не держать память
         self._history.clear()
+
+
+# ---------------------------------------------------------------------------
+# 9. TimelineChartPlugin — генерирует PNG-график истории состояний
+# ---------------------------------------------------------------------------
+
+class TimelineChartPlugin(BasePlugin):
+    """
+    Плагин для генерации финального аналитического графика.
+    
+    Использует данные из TableMonitor после завершения обработки видео.
+    Рисует хронологию переходов и выводит среднее время реакции.
+    """
+
+    def __init__(self, output_dir: str = "reports", filename: str = "timeline.png"):
+        self.output_dir = Path(output_dir)
+        self.filename = filename
+        
+        # Цвета для matplotlib (совпадают по логике с основной системой)
+        self._colors_hex = {
+            TableState.EMPTY:    '#00C800',  # Зеленый
+            TableState.OCCUPIED: '#DC0000',  # Красный
+            TableState.APPROACH: '#FFA500',  # Оранжевый
+        }
+
+    def on_start(self, total_frames: int, fps: float, roi: tuple) -> None:
+        # Создаем папку для отчетов заранее
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+    def on_frame(self, ctx: FrameContext) -> None:
+        # В процессе работы видео ничего не делаем, чтобы не тратить ресурсы
+        pass
+
+    def on_finish(self, monitor: TableMonitor) -> None:
+        """
+        Основная логика: берем накопленные данные из монитора и строим график.
+        """
+        df = monitor.get_events_dataframe()
+        analytics = monitor.get_analytics()
+
+        if df.empty:
+            logger.warning("TimelineChartPlugin: события не зафиксированы, график не будет создан.")
+            return
+
+        # Подготовка фигуры
+        plt.figure(figsize=(15, 6))
+        
+        # Рисуем точки для каждого состояния из колонки 'next_state'
+        # В вашем мониторе это зафиксированные переходы (StateTransition)
+        unique_states = df['next_state'].unique()
+        
+        for state_name in unique_states:
+            subset = df[df['next_state'] == state_name]
+            
+            # Получаем цвет через Enum (state_name там строка, например 'OCCUPIED')
+            try:
+                state_enum = TableState[state_name]
+                color = self._colors_hex.get(state_enum, 'gray')
+            except KeyError:
+                color = 'gray'
+            
+            plt.scatter(
+                subset['timestamp_sec'], 
+                [state_name] * len(subset), 
+                c=color, 
+                label=state_name, 
+                s=30, 
+                marker='|',
+                zorder=3
+            )
+
+        # Формируем заголовок с аналитикой
+        mean_val = analytics.get('mean_response_sec')
+        title_text = "Хронология состояний столика"
+        if mean_val:
+            title_text += f"\nСреднее время между гостями: {mean_val:.1f}с"
+
+        plt.title(title_text, fontsize=14, pad=15)
+        plt.xlabel("Время видео (секунды)", fontsize=12)
+        plt.ylabel("Состояние", fontsize=12)
+        
+        # Сетка и оформление
+        plt.grid(axis='x', linestyle='--', alpha=0.6)
+        plt.yticks(unique_states)
+        plt.legend(frameon=True, loc='upper right')
+        
+        plt.tight_layout()
+        
+        # Сохранение
+        save_path = self.output_dir / self.filename
+        plt.savefig(str(save_path), dpi=200)
+        plt.close()
+        
+        logger.info("TimelineChartPlugin: Аналитический график сохранен в %s", save_path)

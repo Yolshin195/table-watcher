@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import abc
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 import cv2
@@ -29,6 +29,14 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Контекст кадра — единственный объект, передаваемый в плагин
 # ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class PersonDetection:
+    """Результат детекции одного человека на кадре."""
+    bbox: tuple[int, int, int, int]  # (x1, y1, x2, y2)
+    foot_point: tuple[int, int]      # (x, y) - точка для проверки в ROI
+    is_in_roi: bool                  # попал ли в зону
+    confidence: float                # уверенность модели
 
 @dataclass
 class FrameContext:
@@ -44,6 +52,7 @@ class FrameContext:
     state:      TableState          # текущее подтверждённое состояние FSM
     transition: Optional[StateTransition]  # не None если состояние только что изменилось
     occupied:   bool                # детектор нашёл человека в ROI в этом кадре
+    detected_people: list[PersonDetection] = field(default_factory=list)
 
     @property
     def timestamp_sec(self) -> float:
@@ -132,6 +141,7 @@ class VideoProcessor:
 
         self._model         = None   # загружается лениво при первом run()
         self._last_occupied = False  # кэш последнего результата детекции
+        self._last_detections = None # кэш последних определенных людей
 
     # -----------------------------------------------------------------------
     # Регистрация плагинов
@@ -184,8 +194,9 @@ class VideoProcessor:
 
                 # --- Детекция (запускаем YOLO только каждые detection_step кадров) ---
                 if frame_no % self.detection_step == 0:
-                    self._last_occupied = self._detect_person_in_roi(frame, self.roi)
+                    self._last_occupied, self._last_detections = self._detect_person_in_roi(frame, self.roi)
                 occupied = self._last_occupied
+                detections = self._last_detections
 
                 # --- FSM ---
                 transition = self.monitor.update(frame_no, fps, occupied)
@@ -199,6 +210,7 @@ class VideoProcessor:
                     state=self.monitor.state,
                     transition=transition,
                     occupied=occupied,
+                    detected_people=detections,
                 )
 
                 # --- Плагины рисуют / логируют ---
@@ -267,34 +279,40 @@ class VideoProcessor:
             )
 
     def _detect_person_in_roi(
-        self, frame: np.ndarray, roi: tuple[int,int,int,int]
-    ) -> bool:
-        """
-        Запустить YOLO на кадре и проверить, есть ли человек в зоне ROI.
+        self, frame: np.ndarray, roi: tuple[int, int, int, int]
+    ) -> tuple[bool, list[PersonDetection]]:
+        rx, ry, rw, rh = roi
+        roi_x2, roi_y2 = rx + rw, ry + rh
 
-        Returns:
-            True если хотя бы один bbox класса 'person' с достаточной
-            уверенностью пересекается с ROI.
-        """
-        x, y, w, h = roi
-        roi_x2, roi_y2 = x + w, y + h
-
-        # verbose=False подавляет вывод YOLO в консоль
-        results = self._model(frame, verbose=False, classes=[0])  # 0 = person
+        results = self._model(frame, verbose=False, classes=[0])
+        
+        is_occupied_now = False
+        detections = []
 
         for box in results[0].boxes:
-            if float(box.conf[0]) < self.confidence_threshold:
+            conf = float(box.conf[0])
+            if conf < self.confidence_threshold:
                 continue
 
-            bx1, by1, bx2, by2 = map(int, box.xyxy[0])
-            cx = (bx1 + bx2) // 2
-            cy = (by1 + by2) // 2
-
-            # Проверяем центр bbox: попадает ли в прямоугольник ROI
-            if x <= cx <= roi_x2 and y <= cy <= roi_y2:
-                return True
-
-        return False
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+            
+            # Точка проверки (середина нижней границы bbox - "ноги")
+            foot_point = ((x1 + x2) // 2, y2)
+            
+            # Проверка попадания в прямоугольник ROI
+            in_roi = (rx <= foot_point[0] <= roi_x2 and ry <= foot_point[1] <= roi_y2)
+            
+            if in_roi:
+                is_occupied_now = True
+                
+            detections.append(PersonDetection(
+                bbox=(x1, y1, x2, y2),
+                foot_point=foot_point,
+                is_in_roi=in_roi,
+                confidence=conf
+            ))
+            
+        return is_occupied_now, detections
 
     def _make_writer(
         self, fps: float, width: int, height: int
