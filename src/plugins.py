@@ -407,3 +407,68 @@ class LiveViewPlugin(BasePlugin):
  
     def on_finish(self, monitor: TableMonitor) -> None:
         cv2.destroyWindow(self.window_title)
+
+
+# ---------------------------------------------------------------------------
+# 7. TimelinePlugin — отрисовывает историю состояний внизу кадра
+# ---------------------------------------------------------------------------
+class TimelinePlugin(BasePlugin):
+    """
+    Отрисовывает динамический таймлайн в нижней части кадра.
+    Цвет полоски соответствует состоянию стола в конкретный момент времени.
+    """
+
+    def __init__(self, bar_height: int = 15):
+        self.bar_height = bar_height
+        self._total_frames: int = 0
+        # Храним историю состояний для отрисовки всей полоски на каждом кадре
+        self._history: list[TableState] = []
+        
+        # Используем те же цвета, что и в основной системе
+        self._colors = {
+            TableState.EMPTY:    (0, 255, 0),    # Зеленый
+            TableState.OCCUPIED: (0, 0, 255),    # Красный
+            TableState.APPROACH: (0, 255, 255),  # Желтый/Оранжевый
+        }
+
+    def on_start(self, total_frames: int, fps: float, roi: tuple) -> None:
+        self._total_frames = total_frames
+        self._history = []
+
+    def on_frame(self, ctx: FrameContext) -> None:
+        # 1. Запоминаем текущее состояние для истории
+        self._history.append(ctx.state)
+        
+        # 2. Логика отрисовки таймлайна
+        h, w = ctx.frame.shape[:2]
+        
+        if self._total_frames <= 0:
+            return
+
+        # Рассчитываем ширину шага для одного кадра
+        step = w / self._total_frames
+        
+        # Отрисовываем накопленную историю
+        # Для оптимизации: если видео очень длинное, можно рисовать не каждый кадр,
+        # а группировать их, но при текущей логике рисуем всё накопленное.
+        for i, state in enumerate(self._history):
+            x_start = int(i * step)
+            x_end = int((i + 1) * step)
+            
+            color = self._colors.get(state, (100, 100, 100))
+            
+            # Рисуем сегмент таймлайна внизу кадра
+            cv2.rectangle(
+                ctx.frame, 
+                (x_start, h - self.bar_height), 
+                (x_end, h), 
+                color, 
+                -1
+            )
+            
+        # Опционально: рисуем тонкую рамку или разделитель над таймлайном
+        cv2.line(ctx.frame, (0, h - self.bar_height), (w, h - self.bar_height), (255, 255, 255), 1)
+
+    def on_finish(self, monitor: TableMonitor) -> None:
+        # Очищаем историю после завершения, чтобы не держать память
+        self._history.clear()

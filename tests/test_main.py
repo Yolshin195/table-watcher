@@ -17,7 +17,7 @@
 """
 
 import pandas as pd
-from src.main import TableMonitor, TableState, StateTransition, CleanupRecord
+from src.table_monitor import TableMonitor, TableState, StateTransition, CleanupRecord
 
 
 # ---------------------------------------------------------------------------

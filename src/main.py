@@ -1,707 +1,326 @@
-import os
-import matplotlib.pyplot as plt
-from dataclasses import dataclass
-from enum import Enum, auto
-from typing import Optional
-import pandas as pd
-import numpy as np
-import cv2
+"""
+Детекция уборки столиков по видео.
+
+Запуск (минимальный):
+    python main.py --video video1.mp4
+
+Запуск с явным ROI (без интерактивного выбора):
+    python main.py --video video1.mp4 --roi 120 80 240 160
+
+Запуск без визуализации (фоновый режим, быстрее):
+    python main.py --video video1.mp4 --no-overlay
+
+Полный пример:
+    python main.py --video video1.mp4 \
+        --output output.mp4           \
+        --report report.txt           \
+        --snapshots snapshots/        \
+        --confidence 0.45             \
+        --empty-frames 25             \
+        --occupied-frames 4           \
+        --model yolov8n.pt
+"""
+
 import argparse
-from ultralytics import YOLO
-import json
-
-OUTPUT_DIR = "outputs"
-
-# ---------------------------------------------------------------------------
-# Типы данных
-# ---------------------------------------------------------------------------
-
-class TableState(Enum):
-    """Состояния столика."""
-    EMPTY    = auto()   # Стол пустой, никого нет
-    OCCUPIED = auto()   # За столом сидит гость
-    APPROACH = auto()   # Кто-то подошёл впервые после периода пустоты
-
-TABLE_STATE_COLORS = {
-    TableState.EMPTY: (0, 255, 0),      # Зеленый
-    TableState.OCCUPIED: (0, 0, 255),   # Красный
-    TableState.APPROACH: (0, 255, 255), # Желтый (подход)
-}
-
-
-@dataclass(frozen=True)
-class StateTransition:
-    """Факт смены состояния — иммутабельный событийный объект."""
-    frame_no:   int
-    timestamp:  float          # секунды от начала видео
-    prev_state: TableState
-    next_state: TableState
-
-    @property
-    def event_name(self) -> str:
-        return f"{self.prev_state.name} → {self.next_state.name}"
-
-
-@dataclass
-class CleanupRecord:
-    """
-    Одна запись о цикле «стол освободился → кто-то подошёл».
-    Используется для финальной аналитики.
-    """
-    empty_at_frame: int
-    empty_at_sec:   float
-    approach_at_frame: Optional[int] = None
-    approach_at_sec:   Optional[float] = None
-
-    @property
-    def response_time_sec(self) -> Optional[float]:
-        """Время реакции (сколько ждали до уборки/нового гостя)."""
-        if self.approach_at_sec is None:
-            return None
-        return self.approach_at_sec - self.empty_at_sec
+import logging
+import sys
+from pathlib import Path
 
 
 # ---------------------------------------------------------------------------
-# Основной класс
+# Настройка логирования — до любых других импортов
 # ---------------------------------------------------------------------------
 
-class TableMonitor:
-    """
-    Конечный автомат (FSM) для отслеживания состояния одного столика.
-
-    Принцип работы:
-        Вызывай update() на каждом кадре, передавая:
-          - frame_no  : порядковый номер кадра
-          - fps       : частота кадров видео (для перевода в секунды)
-          - occupied  : True если детектор обнаружил человека в зоне ROI
-
-        Класс сам управляет дебаунсом, историей переходов и аналитикой.
-
-    Параметры:
-        min_empty_frames  : сколько кадров подряд зона должна быть пустой,
-                            чтобы зафиксировать переход в EMPTY.
-                            Защищает от мерцания детектора.
-        min_occupied_frames: аналогично для перехода в OCCUPIED.
-    """
-
-    def __init__(
-        self,
-        min_empty_frames:    int = 60,   # ~2 сек при 30fps
-        min_occupied_frames: int = 30,    # ~1 сек — быстрее реагируем на появление
-    ):
-        self.min_empty_frames    = min_empty_frames
-        self.min_occupied_frames = min_occupied_frames
-
-        # --- Текущее подтверждённое состояние ---
-        self._state: TableState = TableState.EMPTY
-
-        # --- Счётчики для дебаунса ---
-        self._consecutive_empty:    int = 0
-        self._consecutive_occupied: int = 0
-
-        # --- История событий (для DataFrame) ---
-        self._transitions: list[StateTransition] = []
-
-        # --- Незакрытые записи об освобождении стола ---
-        self._open_cycles: list[CleanupRecord] = []
-
-        # --- Закрытые циклы (есть и empty_at, и approach_at) ---
-        self._closed_cycles: list[CleanupRecord] = []
-
-        # --- Полная история
-        self.state_history: list[TableState] = []
-
-    # -----------------------------------------------------------------------
-    # Публичный API
-    # -----------------------------------------------------------------------
-
-    @property
-    def state(self) -> TableState:
-        """Текущее подтверждённое состояние столика."""
-        return self._state
-
-    @property
-    def transitions(self) -> list[StateTransition]:
-        """Список всех зафиксированных переходов состояний."""
-        return list(self._transitions)
-
-    def update(self, frame_no: int, fps: float, occupied: bool) -> Optional[StateTransition]:
-        """
-        Обработать один кадр.
-
-        Args:
-            frame_no : порядковый номер кадра (0-based)
-            fps      : частота кадров видео
-            occupied : True если в зоне ROI обнаружен человек
-
-        Returns:
-            StateTransition если состояние изменилось, иначе None.
-        """
-        timestamp = frame_no / fps
-
-        if occupied:
-            self._consecutive_occupied += 1
-            self._consecutive_empty = 0
-        else:
-            self._consecutive_empty += 1
-            self._consecutive_occupied = 0
-
-        transition = self._try_transition(frame_no, timestamp, occupied)
-
-        # Сохраняем текущее состояние в историю после всех расчетов
-        self.state_history.append(self._state)
-
-        return transition
-
-    def get_analytics(self) -> dict:
-        """
-        Итоговая аналитика по всем завершённым циклам.
-
-        Returns:
-            Словарь с ключевыми метриками.
-        """
-        times = [c.response_time_sec for c in self._closed_cycles
-                 if c.response_time_sec is not None]
-
-        if not times:
-            return {
-                "total_cycles":        0,
-                "completed_cycles":    0,
-                "open_cycles":         len(self._open_cycles),
-                "mean_response_sec":   None,
-                "median_response_sec": None,
-                "min_response_sec":    None,
-                "max_response_sec":    None,
-            }
-
-        return {
-            "total_cycles":        len(self._closed_cycles) + len(self._open_cycles),
-            "completed_cycles":    len(self._closed_cycles),
-            "open_cycles":         len(self._open_cycles),
-            "mean_response_sec":   round(sum(times) / len(times), 2),
-            "median_response_sec": round(sorted(times)[len(times) // 2], 2),
-            "min_response_sec":    round(min(times), 2),
-            "max_response_sec":    round(max(times), 2),
-        }
-
-    def get_events_dataframe(self) -> pd.DataFrame:
-        """
-        Все события в виде Pandas DataFrame.
-
-        Колонки: frame_no, timestamp_sec, prev_state, next_state, event_name
-        """
-        if not self._transitions:
-            return pd.DataFrame(columns=[
-                "frame_no", "timestamp_sec", "prev_state", "next_state", "event_name"
-            ])
-
-        return pd.DataFrame([
-            {
-                "frame_no":      t.frame_no,
-                "timestamp_sec": round(t.timestamp, 3),
-                "prev_state":    t.prev_state.name,
-                "next_state":    t.next_state.name,
-                "event_name":    t.event_name,
-            }
-            for t in self._transitions
-        ])
-
-    def get_cycles_dataframe(self) -> pd.DataFrame:
-        """
-        Все циклы «стол освободился → подход» в виде DataFrame.
-
-        Колонки: empty_at_sec, approach_at_sec, response_time_sec, is_completed
-        """
-        all_cycles = self._closed_cycles + self._open_cycles
-        if not all_cycles:
-            return pd.DataFrame(columns=[
-                "empty_at_frame", "empty_at_sec",
-                "approach_at_frame", "approach_at_sec",
-                "response_time_sec", "is_completed",
-            ])
-
-        return pd.DataFrame([
-            {
-                "empty_at_frame":    c.empty_at_frame,
-                "empty_at_sec":      round(c.empty_at_sec, 3),
-                "approach_at_frame": c.approach_at_frame,
-                "approach_at_sec":   round(c.approach_at_sec, 3) if c.approach_at_sec else None,
-                "response_time_sec": round(c.response_time_sec, 2) if c.response_time_sec else None,
-                "is_completed":      c in self._closed_cycles,
-            }
-            for c in all_cycles
-        ])
-    
-    def get_state_history_dataframe(self, fps: float = 30) -> pd.DataFrame:
-        """
-        Возвращает полную посекундную историю состояний столика.
-        
-        Args:
-            fps: частота кадров видео для расчета таймстемпов.
-        """
-        if not self.state_history:
-            return pd.DataFrame(columns=["frame_no", "timestamp_sec", "state"])
-
-        return pd.DataFrame([
-            {
-                "frame_no":      i,
-                "timestamp_sec": round(i / fps, 3),
-                "state":         s.name
-            }
-            for i, s in enumerate(self.state_history)
-        ])
-
-    # -----------------------------------------------------------------------
-    # Внутренняя логика FSM
-    # -----------------------------------------------------------------------
-
-    def _try_transition(
-        self, frame_no: int, timestamp: float, occupied: bool
-    ) -> Optional[StateTransition]:
-        """
-        Проверить, нужно ли менять состояние.
-        Возвращает объект перехода или None.
-        """
-        new_state = self._resolve_new_state(occupied)
-
-        if new_state is None or new_state == self._state:
-            return None
-
-        # Особый случай: EMPTY → OCCUPIED после периода пустоты = APPROACH
-        if self._state == TableState.EMPTY and new_state == TableState.OCCUPIED:
-            new_state = TableState.APPROACH
-
-        transition = StateTransition(
-            frame_no=frame_no,
-            timestamp=timestamp,
-            prev_state=self._state,
-            next_state=new_state,
-        )
-
-        self._apply_transition(transition)
-        return transition
-
-    def _resolve_new_state(self, occupied: bool) -> Optional[TableState]:
-        """
-        На основе счётчиков дебаунса определить, хотим ли перейти в новое состояние.
-        Возвращает None если ещё не накопилось достаточно кадров.
-        """
-        if occupied and self._consecutive_occupied >= self.min_occupied_frames:
-            return TableState.OCCUPIED
-        if not occupied and self._consecutive_empty >= self.min_empty_frames:
-            return TableState.EMPTY
-        return None
-
-    def _apply_transition(self, t: StateTransition) -> None:
-        """Применить переход: обновить состояние и записать аналитику."""
-        self._state = t.next_state
-        self._transitions.append(t)
-
-        # -------------------------------------------------------------------
-        # ДОБАВЛЯЕМ: Сброс счетчиков дебаунса.
-        # Это критически важно! Если не обнулить, то после APPROACH (на 5-м кадре)
-        # на 6-м кадре счетчик станет 6, и система МГНОВЕННО перейдет в OCCUPIED,
-        # не дав дебаунсу отработать заново для подтверждения стабильности.
-        # -------------------------------------------------------------------
-        self._consecutive_empty = 0
-        self._consecutive_occupied = 0
-
-        # Стол освободился — открываем новый цикл ожидания
-        if t.next_state == TableState.EMPTY:
-            self._open_cycles.append(CleanupRecord(
-                empty_at_frame=t.frame_no,
-                empty_at_sec=t.timestamp,
-            ))
-
-        # Кто-то подошёл — закрываем последний открытый цикл
-        elif t.next_state == TableState.APPROACH and self._open_cycles:
-            cycle = self._open_cycles.pop()
-            cycle.approach_at_frame = t.frame_no
-            cycle.approach_at_sec   = t.timestamp
-            self._closed_cycles.append(cycle)
-
-        # -------------------------------------------------------------------
-        # УДАЛЯЕМ:
-        # if t.next_state == TableState.APPROACH:
-        #     self._state = TableState.OCCUPIED
-        # -------------------------------------------------------------------
-        # ПОЧЕМУ УДАЛЯЕМ: Эта строка принудительно меняла состояние "втихую".
-        # Из-за этого в историю (self._transitions) никогда не попадало событие 
-        # перехода в OCCUPIED после подхода. Теперь система сама увидит человека 
-        # на следующем кадре и создаст ЧЕСТНЫЙ переход через метод update().
-        # -------------------------------------------------------------------   
-
-
-# -----------------------------------------------------------------------
-# AnalyticsReporter
-# -----------------------------------------------------------------------
-class AnalyticsReporter:
-    """
-    Класс для генерации наглядных отчетов: графиков, консольных сводок и CSV.
-    """
-    def __init__(self, output_dir: str, colors: dict):
-        self.output_dir = output_dir
-        self.colors_hex = {
-            state: self._rgb_to_hex(color) 
-            for state, color in colors.items()
-        }
-        os.makedirs(self.output_dir, exist_ok=True)
-
-    def _rgb_to_hex(self, rgb):
-        """Конвертирует BGR (OpenCV) в HEX для Matplotlib."""
-        return '#%02x%02x%02x' % (rgb[2], rgb[1], rgb[0])
-
-    def generate_all(self, monitor: TableMonitor):
-        """Запускает полный цикл формирования отчетности."""
-        analytics = monitor.get_analytics()
-        df_events = monitor.get_events_dataframe()
-        df_cycles = monitor.get_cycles_dataframe()
-        df_history = monitor.get_state_history_dataframe()
-
-        # 1. Визуальный отчет (Timeline)
-        self._save_visual_timeline(df_history, analytics)
-
-        # 2. Текстовый Summary в консоль
-        self._print_console_summary(analytics, monitor.state)
-
-        # 3. Сохранение данных
-        df_events.to_csv(f"{self.output_dir}/events_log.csv", index=False)
-        df_cycles.to_csv(f"{self.output_dir}/cleanup_analytics.csv", index=False)
-        df_history.to_csv(f"{self.output_dir}/state_history.csv", index=False)
-        
-        print(f"\n[SUCCESS] Отчеты сохранены в папку: {self.output_dir}")
-
-    def _print_console_summary(self, analytics: dict, current_state):
-        print("\n" + "═"*60)
-        print(" ИТОГОВЫЙ БИЗНЕС-ОТЧЕТ ".center(60, "═"))
-        print(f" Текущий статус стола:      {current_state.name}")
-        print(f" Всего циклов посещения:    {analytics['total_cycles']}")
-        print(f" Из них завершено полностью: {analytics['completed_cycles']}")
-        print("-" * 60)
-        
-        if analytics['completed_cycles'] > 0:
-            print(f" СРЕДНЕЕ ВРЕМЯ ОЖИДАНИЯ:    {analytics['mean_response_sec']} сек.")
-            print(f" Самая быстрая реакция:     {analytics['min_response_sec']} сек.")
-            print(f" Самая долгая пауза:        {analytics['max_response_sec']} сек.")
-        else:
-            print(" [!] Нет завершенных циклов для расчета среднего времени.")
-        print("═"*60)
-
-    def _save_visual_timeline(self, df_history: pd.DataFrame, analytics: dict):
-        if df_history.empty:
-            return
-
-        plt.figure(figsize=(15, 6))
-        
-        # Рисуем точки для каждого состояния
-        for state_name in df_history['state'].unique():
-            subset = df_history[df_history['state'] == state_name]
-            # Получаем цвет из палитры UI (соответствие цветов в видео и на графике)
-            from __main__ import TableState # Импорт для сопоставления Enum
-            state_enum = TableState[state_name]
-            color = self.colors_hex.get(state_enum, 'gray')
-            
-            plt.scatter(subset['timestamp_sec'], [state_name] * len(subset), 
-                        c=color, label=state_name, s=15, marker='|')
-
-        plt.title(f"Хронология состояний стола\nСреднее время между гостями: {analytics.get('mean_response_sec', 'N/A')}с")
-        plt.xlabel("Время (секунды)")
-        plt.ylabel("Состояние")
-        plt.yticks(df_history['state'].unique())
-        plt.grid(axis='x', linestyle='--', alpha=0.5)
-        plt.legend()
-        
-        plt.tight_layout()
-        plt.savefig(f"{self.output_dir}/monitoring_timeline.png", dpi=200)
-        plt.close()
-
-
-# -----------------------------------------------------------------------
-#  ROIManager
-# -----------------------------------------------------------------------
-class ROIManager:
-    """
-    Класс для управления зонами интереса (ROI).
-    Автоматически создает папки и привязывает ROI к конкретным именам файлов.
-    """
-    def __init__(self, config_path: str = "settings/table_config.json"):
-        self.config_path = config_path
-        # Обойти ошибку несуществующей папки:
-        self._ensure_dir()
-
-    def _ensure_dir(self):
-        """Создает папку для конфига, если её нет."""
-        dir_name = os.path.dirname(self.config_path)
-        if dir_name and not os.path.exists(dir_name):
-            os.makedirs(dir_name, exist_ok=True)
-            print(f"[INFO] Создана директория: {dir_name}")
-
-    def get_roi(self, video_path: str) -> np.ndarray:
-        """
-        Загружает ROI для конкретного файла. 
-        Если файл новый — просит выбрать зону.
-        """
-        # Используем только имя файла как ключ (чтобы пути /home/user/... не мешали)
-        file_key = os.path.basename(video_path)
-        
-        all_configs = self._load_all_configs()
-        
-        if file_key in all_configs:
-            print(f"[INFO] Найден сохраненный ROI для файла: {file_key}")
-            roi = all_configs[file_key]
-        else:
-            print(f"[WARN] ROI для '{file_key}' не найден. Требуется настройка.")
-            roi = self._select_interactively(video_path)
-            self._save_config(file_key, roi)
-
-        # Превращаем [x, y, w, h] в полигон
-        x, y, w, h = roi
-        return np.array([[x, y], [x + w, y], [x + w, y + h], [x, y + h]])
-
-    def _load_all_configs(self) -> dict:
-        """Грузит весь JSON файл."""
-        if os.path.exists(self.config_path):
-            try:
-                with open(self.config_path, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-            except Exception as e:
-                print(f"[ERROR] Ошибка чтения конфига: {e}")
-        return {}
-
-    def _save_config(self, file_key: str, roi: list):
-        """Добавляет новый ROI в файл, не стирая старые."""
-        configs = self._load_all_configs()
-        configs[file_key] = roi
-        
-        with open(self.config_path, 'w', encoding='utf-8') as f:
-            json.dump(configs, f, indent=4, ensure_ascii=False)
-        print(f"[SUCCESS] Настройки для {file_key} сохранены.")
-
-    def _select_interactively(self, video_path: str) -> list:
-        cap = cv2.VideoCapture(video_path)
-        ret, frame = cap.read()
-        cap.release()
-        
-        if not ret:
-            raise ValueError(f"Не удалось открыть видео: {video_path}")
-            
-        window_name = f"Select ROI for: {os.path.basename(video_path)}"
-        roi = cv2.selectROI(window_name, frame, fromCenter=False)
-        cv2.destroyWindow(window_name)
-        for _ in range(10): cv2.waitKey(1)
-        
-        x, y, w, h = roi
-        if w == 0 or h == 0:
-            # Fallback: весь кадр, если пользователь нажал Esc
-            h_f, w_f = frame.shape[:2]
-            return [0, 0, w_f, h_f]
-            
-        return [int(x), int(y), int(w), int(h)]
-
-
-# -----------------------------------------------------------------------
-#  TableUI
-# -----------------------------------------------------------------------
-class TableUI:
-    """Класс для централизованной отрисовки интерфейса."""
-    def __init__(self, polygon: np.ndarray):
-        self.polygon = polygon
-        # Единая палитра цветов
-        self.colors = {
-            TableState.EMPTY: (0, 255, 0),      # Зеленый
-            TableState.OCCUPIED: (0, 0, 255),   # Красный
-            TableState.APPROACH: (0, 255, 255), # Желтый (подход)
-        }
-
-    def draw_all(self, frame: np.ndarray, state: TableState, people: list, history: list, total_frames: int):
-        """Рисует все слои: ROI, людей и таймлайн."""
-        current_color = self.colors.get(state, (255, 255, 255))
-
-        # 1. Рисуем людей
-        for person in people:
-            color = (0, 0, 255) if person["in_roi"] else (255, 0, 0)
-            x1, y1, x2, y2 = person["box"]
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-            cv2.circle(frame, person["point"], 5, color, -1)
-
-        # 2. Рисуем ROI (цветом текущего состояния)
-        cv2.polylines(frame, [self.polygon], isClosed=True, color=current_color, thickness=2)
-        cv2.putText(frame, f"Status: {state.name}", (self.polygon[0][0], self.polygon[0][1] - 10), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, current_color, 2)
-
-        # 3. Рисуем таймлайн поверх видео снизу
-        self._draw_timeline(frame, history, total_frames)
-
-    def _draw_timeline(self, frame: np.ndarray, history: list, total_frames: int):
-        """Рисует заполняющуюся полоску внизу кадра."""
-        h, w = frame.shape[:2]
-        bar_h = 15  # Высота полоски в пикселях
-        
-        if total_frames <= 0: return
-
-        # Масштаб: сколько пикселей занимает один кадр
-        step = w / total_frames
-        
-        # Отрисовка накопленной истории
-        for i, s in enumerate(history):
-            x_start = int(i * step)
-            x_end = int((i + 1) * step)
-            color = self.colors.get(s, (100, 100, 100))
-            # Рисуем маленький прямоугольник для этого кадра
-            cv2.rectangle(frame, (x_start, h - bar_h), (x_end, h), color, -1)
-
-
-# -----------------------------------------------------------------------
-#  VideoProcessor
-# -----------------------------------------------------------------------
-class VideoProcessor:
-    def __init__(
-        self, 
-        video_path: str, 
-        monitor: TableMonitor, 
-        polygon: np.ndarray,
-        model_variant: str = "yolov8n.pt",
-        show_view: bool = True
-    ):
-        self.video_path = video_path
-        self.monitor = monitor
-        self.show_view = show_view
-        self.polygon = polygon
-        
-        # Инициализация детектора
-        self.model = YOLO(model_variant)
-        
-        # Видеозахват
-        self.cap = cv2.VideoCapture(video_path)
-        if not self.cap.isOpened():
-            raise ValueError(f"Не удалось открыть видео: {video_path}")
-            
-        self.fps = self.cap.get(cv2.CAP_PROP_FPS)
-        self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        
-        # Настройка записи результата (output.mp4)
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        self.out = cv2.VideoWriter(f'{OUTPUT_DIR}/output.mp4', fourcc, self.fps, (self.width, self.height))
-
-        self.ui = TableUI(polygon)
-        self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-    def process(self):
-        """Основной цикл обработки."""
-        frame_no = 0
-        print(f"Обработка началась (Визуализация: {'ВКЛ' if self.show_view else 'ВЫКЛ'})...")
-
-        try:
-            while self.cap.isOpened():
-                ret, frame = self.cap.read()
-                if not ret:
-                    break
-
-                # 1. Анализ
-                is_occupied_now, detected_people = self._analyze_frame(frame)
-
-                # 2. Логика
-                self.monitor.update(frame_no, self.fps, is_occupied_now)
-
-                # 3. Визуализация и ГЛАВНЫЙ цикл событий UI
-                # Мы передаем управление UI-методу, и он говорит нам, пора ли выходить
-                should_stop = self._handle_output(frame, self.monitor.state, detected_people)
-                
-                if should_stop:
-                    print("[INFO] Прервано пользователем (нажата 'q').")
-                    break
-
-                frame_no += 1
-        finally:
-            self._cleanup()
-
-    def _analyze_frame(self, frame):
-        """Детектирует людей и определяет, кто из них в ROI."""
-        results = self.model.predict(frame, classes=[0], verbose=False)[0]
-        boxes = results.boxes.xyxy.cpu().numpy() if results.boxes else []
-        
-        is_occupied_now = False
-        detected_people = []
-
-        for box in boxes:
-            # Точка проверки (ноги)
-            foot_point = (int((box[0] + box[2]) / 2), int(box[3]))
-            
-            # Проверяем вхождение в полигон
-            in_roi = cv2.pointPolygonTest(self.polygon, foot_point, False) >= 0
-            
-            if in_roi:
-                is_occupied_now = True
-            
-            # Сохраняем данные для отрисовки
-            detected_people.append({
-                "box": box.astype(int),
-                "point": foot_point,
-                "in_roi": in_roi
-            })
-            
-        return is_occupied_now, detected_people
-
-    def _handle_output(self, frame, current_state, detected_people):
-        """Вызывает отрисовку всех слоев интерфейса."""
-        
-        # Используем новый UI менеджер вместо старых cv2.rectangle внутри
-        self.ui.draw_all(
-            frame, 
-            current_state, 
-            detected_people, 
-            self.monitor.state_history, 
-            self.total_frames
-        )
-
-        self.out.write(frame)
-
-        if self.show_view:
-            cv2.imshow("Monitoring", frame)
-            key = cv2.waitKey(1) & 0xFF
-            return key == ord('q')
-        return False
-
-    def _check_exit_key(self):
-        return cv2.waitKey(1) & 0xFF == ord('q')
-
-    def _cleanup(self):
-        self.cap.release()
-        self.out.release()
-        cv2.destroyAllWindows()
-        print("Обработка завершена. Файл 'output.mp4' сохранен.")
-
-
-def main():
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-    parser = argparse.ArgumentParser(description="Table Cleaning Detection Prototype")
-    parser.add_argument("--video", type=str, required=True, help="Путь к видеофайлу")
-    parser.add_argument("--headless", action="store_true", help="Запустить без отображения окна")
+def _setup_logging(verbose: bool) -> None:
+    level = logging.DEBUG if verbose else logging.INFO
+    logging.basicConfig(
+        format="%(asctime)s  %(levelname)-7s  %(message)s",
+        datefmt="%H:%M:%S",
+        level=level,
+        stream=sys.stdout,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Парсинг аргументов
+# ---------------------------------------------------------------------------
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="main.py",
+        description="Детекция уборки столиков по видео с камеры пиццерии.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+
+    # --- Обязательный аргумент ---
+    parser.add_argument(
+        "--video", "-v",
+        required=True,
+        metavar="PATH",
+        help="Путь к входному видеофайлу (mp4, avi, …)",
+    )
+
+    # --- Зона столика ---
+    parser.add_argument(
+        "--roi",
+        nargs=4,
+        type=int,
+        metavar=("X", "Y", "W", "H"),
+        default=None,
+        help=(
+            "Координаты зоны столика: x y w h (в пикселях). "
+            "Если не задано — откроется интерактивный выбор через cv2.selectROI."
+        ),
+    )
+
+    # --- Выходные файлы ---
+    parser.add_argument(
+        "--output", "-o",
+        metavar="PATH",
+        default="output.mp4",
+        help="Путь для сохранения видео с визуализацией (default: output.mp4).",
+    )
+    parser.add_argument(
+        "--report",
+        metavar="PATH",
+        default="report.txt",
+        help="Путь для текстового отчёта (default: report.txt).",
+    )
+    parser.add_argument(
+        "--snapshots",
+        metavar="DIR",
+        default="snapshots",
+        help=(
+            "Директория для PNG-скриншотов в момент событий FSM "
+            "(default: snapshots/). Передай '' чтобы отключить."
+        ),
+    )
+
+    # --- Детектор ---
+    parser.add_argument(
+        "--model",
+        metavar="NAME",
+        default="yolov8n.pt",
+        help="Имя YOLO-модели (default: yolov8n.pt). Варианты: yolov8n/s/m/l/x.pt",
+    )
+    parser.add_argument(
+        "--confidence",
+        type=float,
+        default=0.4,
+        metavar="FLOAT",
+        help="Минимальная уверенность детектора [0.0–1.0] (default: 0.4).",
+    )
+
+    # --- Параметры FSM ---
+    parser.add_argument(
+        "--empty-frames",
+        type=int,
+        default=30,
+        metavar="N",
+        help=(
+            "Сколько кадров подряд зона должна быть пустой, "
+            "чтобы зафиксировать событие EMPTY (default: 30 ≈ 1 сек при 30fps)."
+        ),
+    )
+    parser.add_argument(
+        "--occupied-frames",
+        type=int,
+        default=5,
+        metavar="N",
+        help=(
+            "Сколько кадров подряд в зоне должен быть человек, "
+            "чтобы зафиксировать событие OCCUPIED (default: 5)."
+        ),
+    )
+
+    # --- Режим работы ---
+    parser.add_argument(
+        "--no-overlay",
+        action="store_true",
+        help=(
+            "Фоновый режим: не рисовать overlay на кадрах. "
+            "Видео не записывается. Только аналитика и отчёт."
+        ),
+    )
+    parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Не показывать прогресс-бар в консоли.",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Подробный вывод (DEBUG-уровень).",
+    )
+    parser.add_argument(
+        "--live",
+        action="store_true",
+        help=(
+            "Показывать видео в окне во время обработки. "
+            "Управление: Q/ESC — выход, ПРОБЕЛ — пауза."
+        ),
+    )
+    parser.add_argument(
+        "--scale",
+        type=float,
+        default=1.0,
+        metavar="FLOAT",
+        help="Масштаб окна просмотра [0.1–2.0] (default: 1.0).",
+    )
+
+    return parser
+
+
+# ---------------------------------------------------------------------------
+# Валидация аргументов
+# ---------------------------------------------------------------------------
+
+def _validate(args: argparse.Namespace) -> None:
+    video = Path(args.video)
+    if not video.exists():
+        print(f"Ошибка: файл не найден: {video}", file=sys.stderr)
+        sys.exit(1)
+    if not video.is_file():
+        print(f"Ошибка: путь не является файлом: {video}", file=sys.stderr)
+        sys.exit(1)
+
+    if args.roi is not None:
+        x, y, w, h = args.roi
+        if w <= 0 or h <= 0:
+            print(f"Ошибка: ширина и высота ROI должны быть > 0, получено w={w} h={h}", file=sys.stderr)
+            sys.exit(1)
+
+    if not (0.0 < args.confidence <= 1.0):
+        print(f"Ошибка: --confidence должен быть в диапазоне (0, 1], получено {args.confidence}", file=sys.stderr)
+        sys.exit(1)
+
+    if args.empty_frames < 1:
+        print(f"Ошибка: --empty-frames должен быть >= 1", file=sys.stderr)
+        sys.exit(1)
+
+    if args.occupied_frames < 1:
+        print(f"Ошибка: --occupied-frames должен быть >= 1", file=sys.stderr)
+        sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# Сборка плагинов согласно аргументам
+# ---------------------------------------------------------------------------
+
+def _build_plugins(args: argparse.Namespace) -> list:
+    from plugins import (
+        RoiOverlayPlugin,
+        EventLoggerPlugin,
+        ProgressPlugin,
+        SnapshotPlugin,
+        ReportPlugin,
+        TimelinePlugin,
+    )
+
+    plugins = []
+
+    # Overlay рисуется только если не фоновый режим
+    if not args.no_overlay:
+        plugins.append(RoiOverlayPlugin())
+        plugins.append(TimelinePlugin())
+
+    # Live-просмотр — подключается ПОСЛЕ overlay, чтобы видеть отрисовку
+    if args.live:
+        from plugins import LiveViewPlugin
+        plugins.append(LiveViewPlugin(scale=args.scale))
+
+    # Лог событий FSM в консоль — всегда
+    plugins.append(EventLoggerPlugin())
+
+    # Прогресс-бар
+    if not args.no_progress:
+        plugins.append(ProgressPlugin())
+
+    # Скриншоты в момент событий
+    if args.snapshots:
+        plugins.append(SnapshotPlugin(output_dir=args.snapshots))
+
+    # Текстовый отчёт
+    plugins.append(ReportPlugin(
+        output_path=args.report,
+        video_path=args.video,
+    ))
+
+    return plugins
+
+
+# ---------------------------------------------------------------------------
+# Точка входа
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    parser = _build_parser()
     args = parser.parse_args()
 
-    # 1. Получаем ROI
-    roi_helper = ROIManager()
-    table_polygon = roi_helper.get_roi(args.video)
+    _setup_logging(args.verbose)
+    _validate(args)
 
-    # 2. Инициализируем бизнес-логику
-    # Дебаунс: 30 кадров (~1 сек) для пустоты, 5 кадров для появления
-    monitor = TableMonitor(min_empty_frames=30, min_occupied_frames=5)
+    log = logging.getLogger(__name__)
 
-    # 3. Запускаем процессор
-    processor = VideoProcessor(
-        video_path=args.video, 
-        monitor=monitor,
-        polygon=table_polygon,
-        show_view=not args.headless
+    # Импортируем тяжёлые зависимости после валидации
+    from table_monitor import TableMonitor
+    from video_processor import VideoProcessor
+
+    roi = tuple(args.roi) if args.roi else None
+
+    monitor = TableMonitor(
+        min_empty_frames=args.empty_frames,
+        min_occupied_frames=args.occupied_frames,
     )
-    
-    processor.process()
 
-    # 4. Формирование отчетности    
-    reporter = AnalyticsReporter(output_dir=OUTPUT_DIR, colors=TABLE_STATE_COLORS)
-    reporter.generate_all(monitor)
+    plugins = _build_plugins(args)
+
+    # В фоновом режиме output не пишем
+    output_path = None if args.no_overlay else args.output
+
+    log.info("Видео:   %s", args.video)
+    log.info("Модель:  %s  (confidence=%.2f)", args.model, args.confidence)
+    log.info("FSM:     empty_frames=%d  occupied_frames=%d",
+             args.empty_frames, args.occupied_frames)
+    if roi:
+        log.info("ROI:     x=%d y=%d w=%d h=%d", *roi)
+    else:
+        log.info("ROI:     интерактивный выбор")
+
+    processor = VideoProcessor(
+        video_path=args.video,
+        roi=roi,
+        monitor=monitor,
+        plugins=plugins,
+        confidence_threshold=args.confidence,
+        output_path=output_path,
+        model_name=args.model,
+    )
+
+    monitor = processor.run()
+
+    # Итоговая сводка в консоль
+    analytics = monitor.get_analytics()
+    print()
+    print("─" * 50)
+    print(f"  Циклов завершено : {analytics['completed_cycles']}")
+    print(f"  Циклов открытых  : {analytics['open_cycles']}")
+
+    mean = analytics["mean_response_sec"]
+    if mean is not None:
+        print(f"  Среднее время    : {mean:.1f} сек")
+        print(f"  Медиана          : {analytics['median_response_sec']:.1f} сек")
+        print(f"  Мин / Макс       : {analytics['min_response_sec']:.1f} / {analytics['max_response_sec']:.1f} сек")
+    else:
+        print("  Среднее время    : n/a (нет завершённых циклов)")
+
+    if output_path:
+        print(f"  Видео сохранено  : {output_path}")
+    print(f"  Отчёт сохранён   : {args.report}")
+    if args.snapshots:
+        print(f"  Скриншоты        : {args.snapshots}/")
+    print("─" * 50)
 
 
 if __name__ == "__main__":
