@@ -247,6 +247,7 @@ def _build_plugins(args: argparse.Namespace) -> list:
         TimelineChartPlugin,
         PeopleVisualizerPlugin,
         TableProgressBarPlugin,
+        UnifiedHistoryLogger,
     )
 
     plugins = []
@@ -263,12 +264,13 @@ def _build_plugins(args: argparse.Namespace) -> list:
         from plugins import LiveViewPlugin
         plugins.append(LiveViewPlugin(scale=args.scale))
 
-    # Лог событий FSM в консоль — всегда
-    plugins.append(EventLoggerPlugin())
-
     # Прогресс-бар
     if not args.no_progress:
-        plugins.append(ProgressPlugin())
+        plugins.append(UnifiedHistoryLogger())
+    else:
+        #Если прогресс бар не запущен лог событий FSM в консоль
+        plugins.append(EventLoggerPlugin())
+    
 
     # Скриншоты в момент событий
     if args.snapshots:

@@ -128,7 +128,6 @@ class PeopleVisualizerPlugin(BasePlugin):
 # ---------------------------------------------------------------------------
 # 3. EventLoggerPlugin — логирует каждое событие FSM в консоль
 # ---------------------------------------------------------------------------
-
 class EventLoggerPlugin(BasePlugin):
     """
     Выводит в лог каждый StateTransition в момент его возникновения.
@@ -142,6 +141,12 @@ class EventLoggerPlugin(BasePlugin):
         self._level = level
         self._last_empty_sec: Optional[float] = None
 
+    def _safe_log(self, message: str, *args):
+        """Печатает лог, очищая текущую строку (важно для работы с \r)"""
+        # Очищаем строку в терминале перед выводом лога
+        sys.stdout.write("\r" + " " * 120 + "\r")
+        logger.log(self._level, message, *args)
+
     def on_start(self, total_frames: int, fps: float, roi: tuple) -> None:
         self._last_empty_sec = None
 
@@ -154,24 +159,22 @@ class EventLoggerPlugin(BasePlugin):
 
         if t.next_state == TableState.EMPTY:
             self._last_empty_sec = t.timestamp
-            logger.log(self._level, "[%s | frame %d]  %s", ts, t.frame_no, t.event_name)
+            self._safe_log("[%s | frame %d]  %s", ts, t.frame_no, t.event_name)
 
         elif t.next_state == TableState.APPROACH and self._last_empty_sec is not None:
             delta = t.timestamp - self._last_empty_sec
-            logger.log(
-                self._level,
+            self._safe_log(
                 "[%s | frame %d]  %s  (+%.1fs after empty)",
                 ts, t.frame_no, t.event_name, delta,
             )
             self._last_empty_sec = None
-
         else:
-            logger.log(self._level, "[%s | frame %d]  %s", ts, t.frame_no, t.event_name)
+            self._safe_log("[%s | frame %d]  %s", ts, t.frame_no, t.event_name)
 
     def on_finish(self, monitor: TableMonitor) -> None:
         a = monitor.get_analytics()
-        logger.log(self._level, "─" * 50)
-        logger.log(self._level, "Завершено. Циклов: %d  |  Среднее время реакции: %s",
+        self._safe_log("─" * 50)
+        self._safe_log("Завершено. Циклов: %d  |  Среднее время реакции: %s",
                    a["completed_cycles"],
                    f"{a['mean_response_sec']:.1f}s" if a["mean_response_sec"] else "n/a")
 
@@ -212,19 +215,25 @@ class ProgressPlugin(BasePlugin):
         progress = ctx.frame_no / max(self._total, 1)
         filled   = int(self.bar_width * progress)
         bar      = "█" * filled + "░" * (self.bar_width - filled)
-        eta      = (elapsed / progress - elapsed) if progress > 0 else 0
-        ts       = ctx.timestamp_sec
+        
+        eta = (elapsed / progress - elapsed) if progress > 0 else 0
+        ts  = ctx.timestamp_sec
 
-        sys.stdout.write(
-            f"\r[{bar}] {progress*100:5.1f}%  "
-            f"video={ts:.1f}s  wall={elapsed:.0f}s  ETA={eta:.0f}s  "
-            f"state={ctx.state.name:<8}"
+        # Формируем строку. \r возвращает курсор в начало.
+        # Конец строки дополняем пробелами, чтобы затереть старые хвосты если они были.
+        output = (
+            f"\r[{bar}] {progress*100:5.1f}% | "
+            f"video:{ts:>6.1f}s | wall:{int(elapsed):>4}s | "
+            f"ETA:{int(eta):>4}s | {ctx.state.name:<9}"
         )
+        sys.stdout.write(output)
         sys.stdout.flush()
 
     def on_finish(self, monitor: TableMonitor) -> None:
         elapsed = time.monotonic() - self._t0
-        sys.stdout.write(f"\rГотово за {elapsed:.1f}s{' ' * 40}\n")
+        # Очищаем строку полностью перед финальным сообщением
+        sys.stdout.write("\r" + " " * 120 + "\r")
+        sys.stdout.write(f"✅ Обработка завершена за {elapsed:.1f}s\n")
         sys.stdout.flush()
 
 
@@ -675,3 +684,86 @@ class TableProgressBarPlugin(BasePlugin):
             # --- 4. Контур (Рамка) ---
             cv2.rectangle(ctx.frame, (self.x, curr_y), 
                           (self.x + self.width, curr_y + self.bar_h), (150, 150, 150), 1)
+
+
+class UnifiedHistoryLogger(BasePlugin):
+    """
+    Финальная версия логгера для ТЗ.
+    Фиксирует: Старт -> Все переходы -> Аналитику задержек.
+    Показывает: % прогресса, Frame, Video Time, Wall Time, ETA и Processing FPS.
+    """
+    def __init__(self, bar_width: int = 20):
+        self.bar_width = bar_width
+        self._total_frames = 0
+        self._t0 = 0.0
+        self._last_empty_sec = None
+        self._first_frame = True
+
+    def on_start(self, total_frames: int, fps: float, roi: tuple) -> None:
+        self._total_frames = total_frames
+        self._t0 = time.monotonic()
+        print("\n" + "="*95)
+        print(f"ROI: {roi} | TOTAL FRAMES: {total_frames}")
+        print("="*95 + "\n")
+
+    def _build_line(self, ctx: FrameContext, state_text: str) -> str:
+        elapsed = time.monotonic() - self._t0
+        progress = ctx.frame_no / max(self._total_frames, 1)
+        
+        # Расчет FPS обработки (сколько кадров в секунду обрабатывает ПК)
+        proc_fps = ctx.frame_no / elapsed if elapsed > 0 else 0
+        
+        # Визуальный бар
+        filled = int(self.bar_width * progress)
+        bar = "█" * filled + "░" * (self.bar_width - filled)
+        
+        eta = (elapsed / progress - elapsed) if progress > 0 else 0
+        
+        # Сборка строки: [Бар] % | frame | video | wall | ETA | FPS | Status
+        return (
+            f"[{bar}] {progress*100:4.1f}% | "
+            f"frame: {ctx.frame_no:>5} | "
+            f"video:{ctx.timestamp_sec:>6.1f}s | "
+            f"wall:{int(elapsed):>3}s | "
+            f"ETA:{int(eta):>3}s | "
+            f"{proc_fps:>4.1f} fps | "
+            f"{state_text}"
+        )
+
+    def on_frame(self, ctx: FrameContext) -> None:
+        # 1. Фиксируем ТОЧКУ СТАРТА (первый кадр видео)
+        if self._first_frame:
+            line = self._build_line(ctx, f"{ctx.state.name}")
+            sys.stdout.write(f"\r{line}\n")
+            self._first_frame = False
+            return
+
+        # 2. ФИКСАЦИЯ ПЕРЕХОДА (в историю)
+        if ctx.transition:
+            t = ctx.transition
+            msg = f"{t.prev_state.name} → {t.next_state.name}"
+            
+            if t.next_state == TableState.APPROACH and self._last_empty_sec is not None:
+                delta = ctx.timestamp_sec - self._last_empty_sec
+                msg += f" (+{delta:.1f}s)"
+            
+            if t.next_state == TableState.EMPTY:
+                self._last_empty_sec = ctx.timestamp_sec
+
+            line = self._build_line(ctx, msg)
+            sys.stdout.write(f"\r{line}\n")
+            sys.stdout.flush()
+            return
+
+        # 3. ЖИВОЕ ОБНОВЛЕНИЕ (каждые 5 кадров)
+        if ctx.frame_no % 5 == 0:
+            line = self._build_line(ctx, f"Status: {ctx.state.name}")
+            sys.stdout.write(f"\r{line}")
+            sys.stdout.flush()
+
+    def on_finish(self, monitor: TableMonitor) -> None:
+        a = monitor.get_analytics()
+        print("\n" + "─"*95)
+        if a['mean_response_sec']:
+            print(f"📊 СРЕДНЕЕ ВРЕМЯ МЕЖДУ ГОСТЯМИ (ТЗ): {a['mean_response_sec']} сек")
+        print("="*95 + "\n")
