@@ -314,12 +314,19 @@ class VideoProcessor:
             
         return is_occupied_now, detections
 
-    def _make_writer(
-        self, fps: float, width: int, height: int
-    ) -> cv2.VideoWriter:
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    def _make_writer(self, fps: float, width: int, height: int) -> cv2.VideoWriter:
+        fourcc = cv2.VideoWriter_fourcc(*"avc1") 
+        
         writer = cv2.VideoWriter(self.output_path, fourcc, fps, (width, height))
+        
+        if not writer.isOpened():
+            logger.warning("Кодек avc1 не доступен, откат на mp4v")
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            writer = cv2.VideoWriter(self.output_path, fourcc, fps, (width, height))
+        
         if not writer.isOpened():
             raise RuntimeError(f"Не удалось создать VideoWriter: {self.output_path}")
+        
         logger.info("Запись видео: %s", self.output_path)
         return writer
+    
