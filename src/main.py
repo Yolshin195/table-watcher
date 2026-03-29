@@ -105,6 +105,17 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Имя YOLO-модели (default: yolov8n.pt). Варианты: yolov8n/s/m/l/x.pt",
     )
     parser.add_argument(
+        "--step",
+        type=int,
+        default=1,
+        metavar="N",
+        help=(
+            "Запускать детектор только на каждом N-м кадре. "
+            "Остальные кадры используют последний результат. "
+            "step=3 даёт ~3× ускорение без потери точности меток (default: 1)."
+        ),
+    )
+    parser.add_argument(
         "--confidence",
         type=float,
         default=0.4,
@@ -280,7 +291,7 @@ def main() -> None:
     output_path = None if args.no_overlay else args.output
 
     log.info("Видео:   %s", args.video)
-    log.info("Модель:  %s  (confidence=%.2f)", args.model, args.confidence)
+    log.info("Модель:  %s  (confidence=%.2f  step=%d)", args.model, args.confidence, args.step)
     log.info("FSM:     empty_frames=%d  occupied_frames=%d",
              args.empty_frames, args.occupied_frames)
     if roi:
@@ -296,6 +307,7 @@ def main() -> None:
         confidence_threshold=args.confidence,
         output_path=output_path,
         model_name=args.model,
+        detection_step=args.step,
     )
 
     monitor = processor.run()

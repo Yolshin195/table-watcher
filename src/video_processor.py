@@ -116,6 +116,7 @@ class VideoProcessor:
         confidence_threshold: float = 0.4,
         output_path:          Optional[str] = None,
         model_name:           str = "yolov8n.pt",
+        detection_step:       int = 1,
     ):
         self.video_path           = video_path
         self.roi                  = roi
@@ -123,12 +124,14 @@ class VideoProcessor:
         self.confidence_threshold = confidence_threshold
         self.output_path          = output_path
         self.model_name           = model_name
+        self.detection_step       = max(1, detection_step)
 
         self._plugins: list[BasePlugin] = []
         for p in (plugins or []):
             self.add_plugin(p)
 
-        self._model = None   # загружается лениво при первом run()
+        self._model         = None   # загружается лениво при первом run()
+        self._last_occupied = False  # кэш последнего результата детекции
 
     # -----------------------------------------------------------------------
     # Регистрация плагинов
@@ -179,8 +182,10 @@ class VideoProcessor:
                 if not ret:
                     break
 
-                # --- Детекция ---
-                occupied = self._detect_person_in_roi(frame, self.roi)
+                # --- Детекция (запускаем YOLO только каждые detection_step кадров) ---
+                if frame_no % self.detection_step == 0:
+                    self._last_occupied = self._detect_person_in_roi(frame, self.roi)
+                occupied = self._last_occupied
 
                 # --- FSM ---
                 transition = self.monitor.update(frame_no, fps, occupied)
