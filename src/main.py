@@ -246,6 +246,7 @@ def _build_plugins(args: argparse.Namespace) -> list:
         TimelinePlugin,
         TimelineChartPlugin,
         PeopleVisualizerPlugin,
+        TableProgressBarPlugin,
     )
 
     plugins = []
@@ -255,6 +256,7 @@ def _build_plugins(args: argparse.Namespace) -> list:
         plugins.append(RoiOverlayPlugin())
         plugins.append(PeopleVisualizerPlugin())
         plugins.append(TimelinePlugin())
+        plugins.append(TableProgressBarPlugin())
 
     # Live-просмотр — подключается ПОСЛЕ overlay, чтобы видеть отрисовку
     if args.live:

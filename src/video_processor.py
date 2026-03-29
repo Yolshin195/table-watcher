@@ -21,7 +21,7 @@ from typing import Optional
 import cv2
 import numpy as np
 
-from table_monitor import TableMonitor, TableState, StateTransition
+from table_monitor import TableMonitor, TableState, StateTransition, ProgressSnapshot
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +52,7 @@ class FrameContext:
     state:      TableState          # текущее подтверждённое состояние FSM
     transition: Optional[StateTransition]  # не None если состояние только что изменилось
     occupied:   bool                # детектор нашёл человека в ROI в этом кадре
+    progress:   ProgressSnapshot    # 
     detected_people: list[PersonDetection] = field(default_factory=list)
 
     @property
@@ -223,6 +224,7 @@ class VideoProcessor:
                     transition=transition,
                     occupied=occupied,
                     detected_people=detections,
+                    progress=self.monitor.get_progress(),
                 )
 
                 # --- Плагины рисуют / логируют ---

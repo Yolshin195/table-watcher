@@ -71,6 +71,14 @@ class StateTransition:
         return f"{self.prev_state.name} → {self.next_state.name}"
 
 
+@dataclass(frozen=True)
+class ProgressSnapshot:
+    """Процент заполнения порогов (0.0 - 1.0)."""
+    to_approach: float
+    to_occupied: float
+    to_empty:    float
+
+
 @dataclass
 class CleanupRecord:
     """
@@ -466,6 +474,20 @@ class TableMonitor:
             }
             for c in all_cycles
         ])
+    
+    def get_progress(self) -> ProgressSnapshot:
+        """Возвращает текущую заполненность счетчиков дебаунса."""
+        ctx = self._ctx
+        
+        # Считаем прогресс, избегая деления на ноль
+        def calc(val, threshold):
+            return min(val / threshold, 1.0) if threshold > 0 else 0.0
+
+        return ProgressSnapshot(
+            to_approach = calc(ctx.consecutive_occupied, ctx.min_occupied_frames),
+            to_occupied = calc(ctx.consecutive_occupied, ctx.min_stay_frames),
+            to_empty    = calc(ctx.consecutive_empty, ctx.min_empty_frames)
+        )
 
     # -----------------------------------------------------------------------
     # Внутренняя механика FSM

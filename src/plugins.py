@@ -595,3 +595,83 @@ class TimelineChartPlugin(BasePlugin):
         plt.close()
         
         logger.info("TimelineChartPlugin: Аналитический график сохранен в %s", save_path)
+
+
+class TableProgressBarPlugin(BasePlugin):
+    """
+    Плагин для визуализации прогресса накопления кадров (дебаунса) в реальном времени.
+    
+    Отображает три горизонтальных индикатора, которые показывают, насколько текущее 
+    состояние счетчиков близко к срабатыванию бизнес-правил перехода:
+    - **APPROACH**: Прогресс появления человека в зоне (Empty -> Approach).
+    - **OCCUPIED**: Прогресс подтверждения гостя (Approach -> Occupied).
+    - **EMPTY**: Прогресс очистки стола (Occupied/Approach -> Empty).
+
+    Цветовая схема синхронизирована с глобальными константами состояний системы.
+    """
+
+    def __init__(self, x: int = 30, y: int = 30, width: int = 220):
+        """
+        Инициализирует плагин отрисовки прогресс-баров.
+
+        Args:
+            x (int): Координата X верхнего левого угла блока индикаторов.
+            y (int): Координата Y верхнего левого угла блока индикаторов.
+            width (int): Ширина полосок в пикселях.
+        """
+        self.x = x
+        self.y = y
+        self.width = width
+        self.bar_h = 12   # Высота одной полоски
+        self.spacing = 25 # Расстояние между полосками (включая место под текст)
+
+    def on_frame(self, ctx: FrameContext) -> None:
+        """
+        Отрисовывает прогресс-бары на текущем кадре видео.
+
+        Данные берутся из `ctx.progress`, который содержит нормализованные 
+        значения (от 0.0 до 1.0), рассчитанные в `TableMonitor`.
+
+        Args:
+            ctx (FrameContext): Объект контекста кадра, содержащий `np.ndarray` 
+                изображения и Snapshot прогресса.
+        """
+        # Связываем ключи прогресса с цветами и названиями из общих констант
+        bars = [
+            ("to_approach", TableState.APPROACH),
+            ("to_occupied", TableState.OCCUPIED),
+            ("to_empty",    TableState.EMPTY),
+        ]
+
+        for i, (progress_key, state_type) in enumerate(bars):
+            # Получаем значение прогресса (защита от отсутствия ключа)
+            value = getattr(ctx.progress, progress_key, 0.0)
+            
+            # Получаем общие цвета и метки
+            color = _STATE_COLORS.get(state_type, (255, 255, 255))
+            label = _STATE_LABELS.get(state_type, "UNKNOWN")
+            
+            # Вычисляем вертикальную позицию текущего элемента
+            curr_y = self.y + i * (self.bar_h + self.spacing)
+            
+            # --- 1. Текст (Заголовок над полоской) ---
+            # Черная обводка для читаемости на любом фоне
+            cv2.putText(ctx.frame, label, (self.x, curr_y - 8), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 2, cv2.LINE_AA)
+            # Белый текст с процентами
+            cv2.putText(ctx.frame, f"{label}: {int(value*100)}%", (self.x, curr_y - 8), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
+
+            # --- 2. Подложка полоски (Фон) ---
+            cv2.rectangle(ctx.frame, (self.x, curr_y), 
+                          (self.x + self.width, curr_y + self.bar_h), (30, 30, 30), -1)
+            
+            # --- 3. Активный прогресс ---
+            fill_w = int(self.width * value)
+            if fill_w > 0:
+                cv2.rectangle(ctx.frame, (self.x, curr_y), 
+                              (self.x + fill_w, curr_y + self.bar_h), color, -1)
+                
+            # --- 4. Контур (Рамка) ---
+            cv2.rectangle(ctx.frame, (self.x, curr_y), 
+                          (self.x + self.width, curr_y + self.bar_h), (150, 150, 150), 1)
