@@ -651,3 +651,90 @@ class TestDebounceIntegrity:
         assert m._consecutive_occupied == 0, (
             f"Счетчик _consecutive_occupied равен {m._consecutive_occupied}, а должен быть 0"
         )
+
+
+# ---------------------------------------------------------------------------
+# Группа 10: Тесты, которые ДОЛЖНЫ ПАДАТЬ (демонстрация бага)
+# ---------------------------------------------------------------------------
+
+class TestApproachShouldBehaveAsState:
+
+    def test_approach_to_occupied_transition_exists(self):
+        """
+        ОЖИДАЕМОЕ ПОВЕДЕНИЕ:
+        После APPROACH должен быть переход в OCCUPIED.
+
+        ФАКТ:
+        Его нет → тест падает.
+        """
+        m = make_monitor(empty=3, occupied=2)
+
+        feed(m, True, 5)
+
+        events = [(t.prev_state, t.next_state) for t in m.transitions]
+
+        assert any(
+            prev == TableState.APPROACH and next_ == TableState.OCCUPIED
+            for prev, next_ in events
+        ), "Нет перехода APPROACH → OCCUPIED"
+
+
+    def test_state_matches_last_transition(self):
+        """
+        ОЖИДАЕМОЕ ПОВЕДЕНИЕ:
+        Текущее состояние всегда равно последнему next_state в истории.
+
+        ФАКТ:
+        После APPROACH состояние уже OCCUPIED → рассинхрон → тест падает.
+        """
+        m = make_monitor(empty=3, occupied=2)
+
+        feed(m, True, 2)
+
+        last_transition = m.transitions[-1]
+
+        assert m.state == last_transition.next_state, (
+            f"Состояние ({m.state}) не совпадает с историей ({last_transition.next_state})"
+        )
+
+
+    def test_approach_persists_at_least_one_frame(self):
+        """
+        ОЖИДАЕМОЕ ПОВЕДЕНИЕ:
+        APPROACH должен существовать хотя бы 1 кадр как состояние.
+
+        ФАКТ:
+        Он мгновенно превращается в OCCUPIED → тест падает.
+        """
+        m = make_monitor(empty=3, occupied=2)
+
+        states = []
+
+        for i in range(5):
+            m.update(i, FPS, True)
+            states.append(m.state)
+
+        assert TableState.APPROACH in states, (
+            "APPROACH ни разу не был текущим состоянием"
+        )
+
+
+    def test_approach_duration_positive(self):
+        """
+        ОЖИДАЕМОЕ ПОВЕДЕНИЕ:
+        Можно измерить длительность APPROACH (>= 1 кадр).
+
+        ФАКТ:
+        APPROACH не имеет длительности → тест падает.
+        """
+        m = make_monitor(empty=3, occupied=2)
+
+        approach_frames = []
+
+        for i in range(5):
+            m.update(i, FPS, True)
+            if m.state == TableState.APPROACH:
+                approach_frames.append(i)
+
+        assert len(approach_frames) > 0, "APPROACH никогда не активен"
+        assert len(approach_frames) >= 1, "APPROACH должен длиться хотя бы 1 кадр"
