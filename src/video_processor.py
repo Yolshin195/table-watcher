@@ -176,6 +176,18 @@ class VideoProcessor:
         # Инициализируем модель
         self._model = self._load_model()
 
+        # --- НОВАЯ ЛОГИКА ОПРЕДЕЛЕНИЯ СТАРТА ---
+        ret, first_frame = cap.read()
+        if ret:
+            # Проверяем первый кадр
+            is_occupied, detections = self._detect_person_in_roi(first_frame, self.roi)
+            # Сообщаем монитору, с чего мы начинаем
+            self.monitor.set_initial_state(is_occupied, frame_no=0, fps=fps)
+            
+            # Перематываем обратно на 0 кадр, чтобы основной цикл обработал его снова
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        # ---------------------------------------
+
         # Инициализируем запись выходного видео
         writer = self._make_writer(fps, frame_w, frame_h) if self.output_path else None
 

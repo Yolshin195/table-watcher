@@ -35,6 +35,9 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Optional
 import pandas as pd
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -177,11 +180,25 @@ class _EmptyState(_BaseTableState):
     def tag(self) -> TableState:
         return TableState.EMPTY
 
+    # ToDo: Удалить после проверки работы нового метода
+    # def on_enter(self, ctx: _MonitorContext, frame_no: int, timestamp: float) -> None:
+    #     ctx.open_cycles.append(CleanupRecord(
+    #         empty_at_frame=frame_no,
+    #         empty_at_sec=timestamp,
+    #     ))
+    
     def on_enter(self, ctx: _MonitorContext, frame_no: int, timestamp: float) -> None:
-        ctx.open_cycles.append(CleanupRecord(
-            empty_at_frame=frame_no,
-            empty_at_sec=timestamp,
-        ))
+        # Если это самый старт (нет переходов) ИЛИ мы пришли из OCCUPIED
+        is_startup = not ctx.transitions
+        came_from_occupied = ctx.transitions and ctx.transitions[-1].prev_state == TableState.OCCUPIED
+
+        if is_startup or came_from_occupied:
+            # Проверяем, нет ли уже открытого цикла (на всякий случай)
+            if not ctx.open_cycles:
+                ctx.open_cycles.append(CleanupRecord(
+                    empty_at_frame=frame_no,
+                    empty_at_sec=timestamp,
+                ))
 
     def handle(
         self,
@@ -325,6 +342,22 @@ class TableMonitor:
         # Начальное состояние — стол пустой.
         # on_enter не вызываем: нет предыдущего гостя, цикл ожидания не нужен.
         self._current: _BaseTableState = _EmptyState()
+
+    def set_initial_state(self, occupied: bool, frame_no: int, fps: float):
+        """
+        Устанавливает состояние на самом первом кадре видео.
+        """
+        timestamp = frame_no / fps
+        if occupied:
+            # Если сразу видим человека, ставим OCCUPIED
+            self._current = _OccupiedState()
+            # Важно: МЫ НЕ ОТКРЫВАЕМ ЦИКЛ, так как стол еще не освобождался
+            logger.info("Старт системы: стол ЗАНЯТ")
+        else:
+            # Если стол пуст, вызываем on_enter у EmptyState
+            self._current = _EmptyState()
+            self._current.on_enter(self._ctx, frame_no, timestamp)
+            logger.info("Старт системы: стол СВОБОДЕН")
 
     # -----------------------------------------------------------------------
     # Публичный API
