@@ -1,0 +1,409 @@
+"""
+Встроенные плагины для VideoProcessor.
+
+Подключай любой набор в зависимости от задачи:
+
+    from plugins import RoiOverlayPlugin, EventLoggerPlugin, ProgressPlugin, ReportPlugin
+
+    processor = VideoProcessor("video.mp4", plugins=[
+        RoiOverlayPlugin(),
+        EventLoggerPlugin(),
+        ProgressPlugin(),
+        ReportPlugin("report.txt"),
+    ])
+"""
+
+from __future__ import annotations
+
+import logging
+import sys
+import time
+from pathlib import Path
+from typing import Optional
+
+import cv2
+import numpy as np
+
+from table_monitor import TableMonitor, TableState, StateTransition
+from video_processor import BasePlugin, FrameContext
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Цвета состояний (BGR)
+# ---------------------------------------------------------------------------
+
+_STATE_COLORS: dict[TableState, tuple[int,int,int]] = {
+    TableState.EMPTY:    (0, 200, 0),    # зелёный
+    TableState.OCCUPIED: (0, 0, 220),    # красный
+    TableState.APPROACH: (0, 165, 255),  # оранжевый
+}
+
+_STATE_LABELS: dict[TableState, str] = {
+    TableState.EMPTY:    "EMPTY",
+    TableState.OCCUPIED: "OCCUPIED",
+    TableState.APPROACH: "APPROACH",
+}
+
+
+# ---------------------------------------------------------------------------
+# 1. RoiOverlayPlugin — рисует bbox зоны столика и оверлей состояния
+# ---------------------------------------------------------------------------
+
+class RoiOverlayPlugin(BasePlugin):
+    """
+    Рисует на кадре:
+    - Прямоугольник зоны ROI (цвет зависит от состояния FSM)
+    - Метку состояния над прямоугольником
+    - Таймер сколько секунд стол в текущем состоянии
+    - Опционально: bounding box детекции людей (если show_detections=True)
+    """
+
+    def __init__(self, show_detections: bool = False, thickness: int = 2):
+        self.show_detections = show_detections
+        self.thickness       = thickness
+        self._state_since_sec: float = 0.0
+
+    def on_start(self, total_frames: int, fps: float, roi: tuple) -> None:
+        self._state_since_sec = 0.0
+        self._last_state: Optional[TableState] = None
+
+    def on_frame(self, ctx: FrameContext) -> None:
+        # Обновляем таймер при смене состояния
+        if ctx.transition is not None:
+            self._state_since_sec = ctx.timestamp_sec
+        elapsed = ctx.timestamp_sec - self._state_since_sec
+
+        color  = _STATE_COLORS[ctx.state]
+        label  = _STATE_LABELS[ctx.state]
+        x1, y1, x2, y2 = ctx.roi_rect
+
+        # Прямоугольник ROI
+        cv2.rectangle(ctx.frame, (x1, y1), (x2, y2), color, self.thickness)
+
+        # Метка состояния
+        text = f"{label}  {elapsed:.1f}s"
+        (tw, th), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
+        cv2.rectangle(ctx.frame, (x1, y1 - th - baseline - 4), (x1 + tw + 4, y1), color, -1)
+        cv2.putText(
+            ctx.frame, text,
+            (x1 + 2, y1 - baseline - 2),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA,
+        )
+
+    def on_finish(self, monitor: TableMonitor) -> None:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# 2. EventLoggerPlugin — логирует каждое событие FSM в консоль
+# ---------------------------------------------------------------------------
+
+class EventLoggerPlugin(BasePlugin):
+    """
+    Выводит в лог каждый StateTransition в момент его возникновения.
+
+    Пример вывода:
+        [00:01:23.4 | frame 2081]  OCCUPIED → EMPTY
+        [00:01:47.1 | frame 2513]  EMPTY    → APPROACH  (+23.7s)
+    """
+
+    def __init__(self, level: int = logging.INFO):
+        self._level = level
+        self._last_empty_sec: Optional[float] = None
+
+    def on_start(self, total_frames: int, fps: float, roi: tuple) -> None:
+        self._last_empty_sec = None
+
+    def on_frame(self, ctx: FrameContext) -> None:
+        if ctx.transition is None:
+            return
+
+        t = ctx.transition
+        ts = self._fmt_time(t.timestamp)
+
+        if t.next_state == TableState.EMPTY:
+            self._last_empty_sec = t.timestamp
+            logger.log(self._level, "[%s | frame %d]  %s", ts, t.frame_no, t.event_name)
+
+        elif t.next_state == TableState.APPROACH and self._last_empty_sec is not None:
+            delta = t.timestamp - self._last_empty_sec
+            logger.log(
+                self._level,
+                "[%s | frame %d]  %s  (+%.1fs after empty)",
+                ts, t.frame_no, t.event_name, delta,
+            )
+            self._last_empty_sec = None
+
+        else:
+            logger.log(self._level, "[%s | frame %d]  %s", ts, t.frame_no, t.event_name)
+
+    def on_finish(self, monitor: TableMonitor) -> None:
+        a = monitor.get_analytics()
+        logger.log(self._level, "─" * 50)
+        logger.log(self._level, "Завершено. Циклов: %d  |  Среднее время реакции: %s",
+                   a["completed_cycles"],
+                   f"{a['mean_response_sec']:.1f}s" if a["mean_response_sec"] else "n/a")
+
+    @staticmethod
+    def _fmt_time(sec: float) -> str:
+        m, s = divmod(sec, 60)
+        h, m = divmod(m, 60)
+        return f"{int(h):02d}:{int(m):02d}:{s:05.2f}"
+
+
+# ---------------------------------------------------------------------------
+# 3. ProgressPlugin — прогресс-бар в консоли
+# ---------------------------------------------------------------------------
+
+class ProgressPlugin(BasePlugin):
+    """
+    Печатает прогресс обработки в одну строку (перезаписывает её через \r).
+    Обновляется раз в update_every кадров чтобы не тормозить.
+    """
+
+    def __init__(self, update_every: int = 30, bar_width: int = 40):
+        self.update_every = update_every
+        self.bar_width    = bar_width
+        self._total: int  = 0
+        self._fps: float  = 30.0
+        self._t0: float   = 0.0
+
+    def on_start(self, total_frames: int, fps: float, roi: tuple) -> None:
+        self._total = total_frames
+        self._fps   = fps
+        self._t0    = time.monotonic()
+
+    def on_frame(self, ctx: FrameContext) -> None:
+        if ctx.frame_no % self.update_every != 0:
+            return
+
+        elapsed  = time.monotonic() - self._t0
+        progress = ctx.frame_no / max(self._total, 1)
+        filled   = int(self.bar_width * progress)
+        bar      = "█" * filled + "░" * (self.bar_width - filled)
+        eta      = (elapsed / progress - elapsed) if progress > 0 else 0
+        ts       = ctx.timestamp_sec
+
+        sys.stdout.write(
+            f"\r[{bar}] {progress*100:5.1f}%  "
+            f"video={ts:.1f}s  wall={elapsed:.0f}s  ETA={eta:.0f}s  "
+            f"state={ctx.state.name:<8}"
+        )
+        sys.stdout.flush()
+
+    def on_finish(self, monitor: TableMonitor) -> None:
+        elapsed = time.monotonic() - self._t0
+        sys.stdout.write(f"\rГотово за {elapsed:.1f}s{' ' * 40}\n")
+        sys.stdout.flush()
+
+
+# ---------------------------------------------------------------------------
+# 4. SnapshotPlugin — сохраняет кадр при каждой смене состояния
+# ---------------------------------------------------------------------------
+
+class SnapshotPlugin(BasePlugin):
+    """
+    Сохраняет PNG-скриншот кадра в момент каждого StateTransition.
+    Удобно для README: «пример проблемного кадра».
+
+    Файлы: {output_dir}/frame_{frame_no:06d}_{event}.png
+    """
+
+    def __init__(self, output_dir: str = "snapshots"):
+        self.output_dir = Path(output_dir)
+
+    def on_start(self, total_frames: int, fps: float, roi: tuple) -> None:
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+    def on_frame(self, ctx: FrameContext) -> None:
+        if ctx.transition is None:
+            return
+
+        event_tag = f"{ctx.transition.prev_state.name}_to_{ctx.transition.next_state.name}"
+        filename  = self.output_dir / f"frame_{ctx.frame_no:06d}_{event_tag}.png"
+        cv2.imwrite(str(filename), ctx.frame)
+        logger.debug("Snapshot: %s", filename)
+
+    def on_finish(self, monitor: TableMonitor) -> None:
+        snaps = list(self.output_dir.glob("*.png"))
+        logger.info("SnapshotPlugin: сохранено %d скриншотов в %s", len(snaps), self.output_dir)
+
+
+# ---------------------------------------------------------------------------
+# 5. ReportPlugin — записывает текстовый отчёт после обработки
+# ---------------------------------------------------------------------------
+
+class ReportPlugin(BasePlugin):
+    """
+    После обработки всего видео записывает текстовый отчёт в файл.
+
+    Формат:
+        === Отчёт по видео ===
+        Видео:    video1.mp4
+        ROI:      x=120 y=80 w=240 h=160
+        ...
+        Среднее время реакции: 34.2 сек
+        Медиана:               28.5 сек
+        ...
+        === События ===
+        00:01:23.40  OCCUPIED → EMPTY
+        00:01:47.10  EMPTY    → APPROACH  (+23.7s)
+    """
+
+    def __init__(self, output_path: str = "report.txt", video_path: str = ""):
+        self.output_path = Path(output_path)
+        self.video_path  = video_path
+        self._roi: Optional[tuple] = None
+
+    def on_start(self, total_frames: int, fps: float, roi: tuple) -> None:
+        self._roi        = roi
+        self._total      = total_frames
+        self._fps        = fps
+
+    def on_frame(self, ctx: FrameContext) -> None:
+        pass  # всё делаем в on_finish
+
+    def on_finish(self, monitor: TableMonitor) -> None:
+        a   = monitor.get_analytics()
+        df  = monitor.get_events_dataframe()
+        cyc = monitor.get_cycles_dataframe()
+
+        lines = [
+            "=" * 54,
+            "  Отчёт: детекция уборки столиков",
+            "=" * 54,
+            f"  Видео:          {self.video_path or '—'}",
+            f"  ROI:            x={self._roi[0]} y={self._roi[1]} "
+            f"w={self._roi[2]} h={self._roi[3]}",
+            f"  Всего кадров:   {self._total}",
+            f"  FPS:            {self._fps:.1f}",
+            "",
+            "  Аналитика",
+            "  " + "─" * 36,
+            f"  Циклов завершено:  {a['completed_cycles']}",
+            f"  Циклов открытых:   {a['open_cycles']}",
+            f"  Среднее время:     {self._fmt(a['mean_response_sec'])}",
+            f"  Медиана:           {self._fmt(a['median_response_sec'])}",
+            f"  Минимум:           {self._fmt(a['min_response_sec'])}",
+            f"  Максимум:          {self._fmt(a['max_response_sec'])}",
+            "",
+            "  События",
+            "  " + "─" * 36,
+        ]
+
+        for _, row in df.iterrows():
+            lines.append(
+                f"  {self._ts(row['timestamp_sec'])}"
+                f"  {row['prev_state']:<8} → {row['next_state']}"
+            )
+
+        if not cyc.empty:
+            lines += ["", "  Циклы (стол освободился → подход)", "  " + "─" * 36]
+            for _, row in cyc.iterrows():
+                rt = f"{row['response_time_sec']:.1f}s" if row["response_time_sec"] else "—"
+                status = "OK" if row["is_completed"] else "open"
+                lines.append(
+                    f"  empty={self._ts(row['empty_at_sec'])}"
+                    f"  approach={self._ts(row['approach_at_sec']) if row['approach_at_sec'] else '—'}"
+                    f"  delta={rt}  [{status}]"
+                )
+
+        lines.append("=" * 54)
+
+        self.output_path.write_text("\n".join(lines), encoding="utf-8")
+        logger.info("Отчёт сохранён: %s", self.output_path)
+
+    @staticmethod
+    def _fmt(val: Optional[float]) -> str:
+        return f"{val:.2f} сек" if val is not None else "n/a"
+
+    @staticmethod
+    def _ts(sec: Optional[float]) -> str:
+        if sec is None:
+            return "—"
+        m, s = divmod(sec, 60)
+        h, m = divmod(m, 60)
+        return f"{int(h):02d}:{int(m):02d}:{s:05.2f}"
+
+
+# ---------------------------------------------------------------------------
+# 6. LiveViewPlugin — показывает кадры в окне cv2.imshow в реальном времени
+# ---------------------------------------------------------------------------
+ 
+class LiveViewPlugin(BasePlugin):
+    """
+    Открывает окно cv2.imshow и показывает каждый обработанный кадр.
+ 
+    Важно: вызывать ПОСЛЕ RoiOverlayPlugin в списке плагинов —
+    тогда в окне будет виден уже нарисованный overlay.
+ 
+    Управление:
+        Q / ESC  — прервать обработку досрочно
+        ПРОБЕЛ   — пауза / продолжить
+ 
+    Args:
+        window_title : заголовок окна
+        scale        : масштаб отображения (1.0 = оригинальный размер,
+                       0.5 = половина — удобно для больших видео)
+        wait_ms      : задержка между кадрами в мс (1 = максимальная скорость,
+                       увеличь для замедленного просмотра)
+    """
+ 
+    class _StopRequested(Exception):
+        """Сигнал досрочного выхода — перехватывается VideoProcessor."""
+        pass
+ 
+    def __init__(
+        self,
+        window_title: str = "Table Monitor",
+        scale:        float = 1.0,
+        wait_ms:      int = 1,
+    ):
+        self.window_title = window_title
+        self.scale        = scale
+        self.wait_ms      = wait_ms
+        self._paused      = False
+        self._stopped     = False
+ 
+    def on_start(self, total_frames: int, fps: float, roi: tuple) -> None:
+        cv2.namedWindow(self.window_title, cv2.WINDOW_NORMAL)
+        logger.info(
+            "LiveViewPlugin: окно '%s' открыто  [Q/ESC=выход  ПРОБЕЛ=пауза]",
+            self.window_title,
+        )
+ 
+    def on_frame(self, ctx: FrameContext) -> None:
+        if self._stopped:
+            return
+ 
+        frame = ctx.frame
+        if self.scale != 1.0:
+            h, w = frame.shape[:2]
+            frame = cv2.resize(
+                frame,
+                (int(w * self.scale), int(h * self.scale)),
+                interpolation=cv2.INTER_LINEAR,
+            )
+ 
+        cv2.imshow(self.window_title, frame)
+ 
+        # Обработка клавиш — пауза блокирует до следующего нажатия
+        while True:
+            key = cv2.waitKey(self.wait_ms) & 0xFF
+ 
+            if key in (ord("q"), ord("Q"), 27):   # Q или ESC
+                logger.info("LiveViewPlugin: пользователь прервал обработку")
+                self._stopped = True
+                raise LiveViewPlugin._StopRequested()
+ 
+            if key == ord(" "):                    # пробел — пауза/продолжить
+                self._paused = not self._paused
+                logger.info("LiveViewPlugin: %s", "пауза" if self._paused else "продолжить")
+ 
+            if not self._paused:
+                break
+ 
+    def on_finish(self, monitor: TableMonitor) -> None:
+        cv2.destroyWindow(self.window_title)
