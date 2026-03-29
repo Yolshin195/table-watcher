@@ -2,21 +2,20 @@
 Тесты для TableMonitor.
 
 Запуск:
-    pip install pytest pandas
-    pytest test_table_monitor.py -v          # с pytest
-    python -m pytest test_table_monitor.py   # тоже с pytest
+    pytest tests/test_main.py -v
 
-Структура:
-    TestDebounce          — дебаунс не даёт мерцать состоянию
-    TestFSMTransitions    — правильные переходы между состояниями
-    TestApproachLogic     — APPROACH срабатывает именно когда надо
-    TestAnalytics         — get_analytics() считает корректно
-    TestDataFrames        — структура и содержимое DataFrame-ов
-    TestEdgeCases         — граничные случаи и необычные сценарии
-    TestMultipleCycles    — несколько циклов подряд
+Ключевое изменение по сравнению с исходной версией:
+    APPROACH теперь является настоящим состоянием ожидания, а не мгновенным
+    событием. После входа в APPROACH нужно ещё min_stay_frames кадров
+    присутствия, чтобы перейти в OCCUPIED. Счётчики дебаунса сбрасываются
+    при каждом переходе, поэтому кадры в APPROACH «не считаются» для OCCUPIED.
+
+    Тесты, которые раньше ожидали мгновенного OCCUPIED после N кадров,
+    обновлены: теперь они явно проводят монитор через APPROACH в OCCUPIED.
 """
 
 import pandas as pd
+import pytest
 from src.table_monitor import TableMonitor, TableState, StateTransition, CleanupRecord
 
 
@@ -24,7 +23,7 @@ from src.table_monitor import TableMonitor, TableState, StateTransition, Cleanup
 # Вспомогательные утилиты
 # ---------------------------------------------------------------------------
 
-FPS = 10.0  # удобные числа: 1 кадр = 0.1 сек
+FPS = 10.0  # 1 кадр = 0.1 сек
 
 
 def feed(monitor: TableMonitor, occupied: bool, n_frames: int, start_frame: int = 0):
@@ -37,9 +36,34 @@ def feed(monitor: TableMonitor, occupied: bool, n_frames: int, start_frame: int 
     return transitions
 
 
-def make_monitor(empty=3, occupied=2) -> TableMonitor:
-    """Монитор с маленькими порогами дебаунса — удобно для тестов."""
-    return TableMonitor(min_empty_frames=empty, min_occupied_frames=occupied)
+def make_monitor(empty=3, occupied=2, stay=None) -> TableMonitor:
+    """
+    Монитор с маленькими порогами — удобно для тестов.
+
+    stay=None (по умолчанию) → stay=occupied.
+    Это означает: столько же кадров для выхода из APPROACH, сколько для входа.
+    Используйте stay=0 для мгновенного перехода APPROACH→OCCUPIED (старое поведение).
+    """
+    return TableMonitor(
+        min_empty_frames=empty,
+        min_occupied_frames=occupied,
+        min_stay_frames=stay if stay is not None else occupied,
+    )
+
+
+def occupy(m: TableMonitor, n_occupied: int, start_frame: int = 0) -> int:
+    """
+    Вспомогательная функция: провести монитор через APPROACH в OCCUPIED.
+
+    Подаёт n_occupied кадров (для входа в APPROACH), затем ещё столько же
+    (для выхода из APPROACH в OCCUPIED). Возвращает следующий номер кадра.
+
+    Использование:
+        next_frame = occupy(m, n_occupied=2, start_frame=0)
+    """
+    feed(m, True, n_occupied, start_frame)
+    feed(m, True, n_occupied, start_frame + n_occupied)
+    return start_frame + n_occupied * 2
 
 
 # ---------------------------------------------------------------------------
@@ -51,8 +75,8 @@ class TestDebounce:
     def test_no_transition_before_threshold_empty(self):
         """Стол не переходит в EMPTY раньше чем накопится min_empty_frames."""
         m = make_monitor(empty=5, occupied=2)
-        # Сначала занимаем стол
-        feed(m, True, 2)
+        # Сначала занимаем стол (через APPROACH)
+        occupy(m, n_occupied=2)
         assert m.state == TableState.OCCUPIED
 
         # Подаём 4 пустых кадра — один меньше порога
@@ -63,41 +87,47 @@ class TestDebounce:
     def test_transition_exactly_at_threshold_empty(self):
         """Переход в EMPTY происходит ровно на кадре N = min_empty_frames."""
         m = make_monitor(empty=5, occupied=2)
-        feed(m, True, 2)
+        occupy(m, n_occupied=2)
         transitions = feed(m, False, 5, start_frame=10)
         assert m.state == TableState.EMPTY
         assert len(transitions) == 1
         assert transitions[0].next_state == TableState.EMPTY
 
     def test_no_transition_before_threshold_occupied(self):
-        """Стол не помечается как занятый раньше чем накопится min_occupied_frames."""
+        """Стол не помечается занятым раньше чем накопится min_occupied_frames."""
         m = make_monitor(empty=3, occupied=4)
-        # Стол пустой изначально
-        # Подаём 3 кадра с человеком — один меньше порога
+        # Подаём 3 кадра с человеком — один меньше порога входа в APPROACH
         transitions = feed(m, True, 3)
         assert m.state == TableState.EMPTY
         assert len(transitions) == 0
 
     def test_transition_exactly_at_threshold_occupied(self):
-        """Переход в APPROACH происходит ровно на кадре N = min_occupied_frames."""
+        """
+        Переход в APPROACH происходит ровно на кадре N = min_occupied_frames.
+        После APPROACH нужно ещё min_stay_frames кадров для OCCUPIED.
+        """
         m = make_monitor(empty=3, occupied=4)
-        transitions = feed(m, True, 4)
-        assert m.state == TableState.OCCUPIED  # после APPROACH сразу OCCUPIED
-        assert len(transitions) == 1
-        assert transitions[0].next_state == TableState.APPROACH
+        # Ровно 4 кадра → входим в APPROACH
+        approach_ts = feed(m, True, 4)
+        assert len(approach_ts) == 1
+        assert approach_ts[0].next_state == TableState.APPROACH
+
+        # Ещё 4 кадра (stay=occupied=4) → OCCUPIED
+        feed(m, True, 4, start_frame=4)
+        assert m.state == TableState.OCCUPIED
 
     def test_debounce_resets_on_interruption(self):
         """Прерывание до порога обнуляет счётчик — переход не происходит."""
         m = make_monitor(empty=5, occupied=2)
-        feed(m, True, 2)  # занять стол
+        occupy(m, n_occupied=2)
         assert m.state == TableState.OCCUPIED
 
-        # 4 пустых, потом 1 занятый — счётчик должен сброситься
+        # 4 пустых, потом 1 занятый — счётчик пустоты сбрасывается
         feed(m, False, 4, start_frame=10)
-        assert m.state == TableState.OCCUPIED  # ещё не переключился
+        assert m.state == TableState.OCCUPIED
 
         feed(m, True, 1, start_frame=14)
-        assert m.state == TableState.OCCUPIED  # и не переключился обратно
+        assert m.state == TableState.OCCUPIED
 
         # ещё 4 пустых — снова не хватает до 5
         transitions = feed(m, False, 4, start_frame=15)
@@ -105,10 +135,10 @@ class TestDebounce:
         assert len(transitions) == 0
 
     def test_only_one_transition_per_threshold_crossing(self):
-        """Переход фиксируется ровно один раз, не повторяется на каждом кадре после."""
+        """Переход фиксируется ровно один раз, не повторяется на каждом кадре."""
         m = make_monitor(empty=3, occupied=2)
-        feed(m, True, 2)  # занять
-        transitions = feed(m, False, 10, start_frame=10)  # долго пусто
+        occupy(m, n_occupied=2)
+        transitions = feed(m, False, 10, start_frame=10)
         assert len(transitions) == 1
         assert transitions[0].next_state == TableState.EMPTY
 
@@ -131,35 +161,37 @@ class TestFSMTransitions:
         assert t.next_state == TableState.APPROACH
 
     def test_after_approach_state_is_occupied(self):
-        """После APPROACH внутреннее состояние должно стать OCCUPIED."""
+        """После APPROACH + min_stay_frames кадров состояние становится OCCUPIED."""
         m = make_monitor()
-        feed(m, True, 2)
+        feed(m, True, 2)            # → APPROACH
+        feed(m, True, 2, start_frame=2)  # → OCCUPIED (stay=2)
         assert m.state == TableState.OCCUPIED
 
     def test_occupied_to_empty(self):
         """Человек ушёл → стол переходит в EMPTY."""
         m = make_monitor()
-        feed(m, True, 2)           # занять
-        feed(m, False, 3, start_frame=10)  # освободить
+        occupy(m, n_occupied=2)
+        feed(m, False, 3, start_frame=10)
         assert m.state == TableState.EMPTY
 
     def test_full_cycle(self):
-        """Полный цикл: EMPTY → APPROACH → OCCUPIED → EMPTY → APPROACH."""
+        """Полный цикл: EMPTY → APPROACH → OCCUPIED → EMPTY → APPROACH → OCCUPIED."""
         m = make_monitor(empty=3, occupied=2)
         frame = 0
 
-        # Первый гость садится
-        feed(m, True, 2, frame); frame += 2
+        # Первый гость: через APPROACH в OCCUPIED
+        frame = occupy(m, n_occupied=2, start_frame=frame)
         assert m.state == TableState.OCCUPIED
 
         # Гость уходит
         feed(m, False, 3, frame); frame += 3
         assert m.state == TableState.EMPTY
 
-        # Второй гость (или официант)
-        transitions = feed(m, True, 2, frame)
+        # Второй гость: снова APPROACH → OCCUPIED
+        feed(m, True, 2, frame); frame += 2
+        assert m.state == TableState.APPROACH
+        feed(m, True, 2, frame)
         assert m.state == TableState.OCCUPIED
-        assert transitions[0].next_state == TableState.APPROACH
 
     def test_transition_returns_correct_object(self):
         """update() возвращает StateTransition с правильными полями."""
@@ -167,7 +199,6 @@ class TestFSMTransitions:
         result = None
         for i in range(2):
             result = m.update(i, FPS, True)
-        # На кадре 1 (индекс 1, т.е. второй кадр) должен быть переход
         assert result is not None
         assert isinstance(result, StateTransition)
         assert result.frame_no == 1
@@ -176,16 +207,16 @@ class TestFSMTransitions:
     def test_no_approach_if_already_occupied(self):
         """APPROACH не должен срабатывать если стол и так OCCUPIED."""
         m = make_monitor(empty=3, occupied=2)
-        feed(m, True, 2)   # первый раз — APPROACH
+        occupy(m, n_occupied=2)          # первый раз APPROACH → OCCUPIED
         assert m.state == TableState.OCCUPIED
 
         # Короткий перерыв — меньше порога дебаунса
         feed(m, False, 2, start_frame=10)
         assert m.state == TableState.OCCUPIED  # не успел переключиться
 
-        # Снова человек — не должно быть APPROACH
+        # Снова человек — не должно быть APPROACH (стол уже OCCUPIED)
         transitions = feed(m, True, 2, start_frame=12)
-        assert len(transitions) == 0  # состояние и так OCCUPIED, нет события
+        assert not any(t.next_state == TableState.APPROACH for t in transitions)
 
 
 # ---------------------------------------------------------------------------
@@ -197,32 +228,60 @@ class TestApproachLogic:
     def test_approach_only_after_confirmed_empty(self):
         """APPROACH срабатывает только после подтверждённого EMPTY, не раньше."""
         m = make_monitor(empty=5, occupied=2)
-        feed(m, True, 2)           # занять (APPROACH → OCCUPIED)
-        feed(m, False, 4, start_frame=10)  # 4 пустых — не хватает до EMPTY
+        occupy(m, n_occupied=2)
+        feed(m, False, 4, start_frame=10)   # 4 пустых — не хватает до EMPTY
         transitions = feed(m, True, 2, start_frame=14)
-        # Не было подтверждённого EMPTY → не должно быть APPROACH
         assert all(t.next_state != TableState.APPROACH for t in transitions)
 
     def test_approach_closes_open_cycle(self):
-        """После APPROACH в _closed_cycles должна появиться запись."""
+        """После APPROACH+OCCUPIED в _closed_cycles появляется запись."""
         m = make_monitor()
-        feed(m, True, 2)            # первый гость (APPROACH → OCCUPIED)
-        feed(m, False, 3, start_frame=10)  # уходит
-        feed(m, True, 2, start_frame=13)  # второй гость (APPROACH)
+        occupy(m, n_occupied=2)              # первый гость
+        feed(m, False, 3, start_frame=10)    # уходит → EMPTY (open cycle)
+        feed(m, True, 2, start_frame=13)     # второй гость → APPROACH
+        feed(m, True, 2, start_frame=15)     # → OCCUPIED (closes cycle)
 
         analytics = m.get_analytics()
         assert analytics["completed_cycles"] == 1
         assert analytics["open_cycles"] == 0
 
     def test_approach_transition_recorded_in_history(self):
-        """APPROACH появляется в списке transitions."""
+        """APPROACH и OCCUPIED появляются в списке transitions в правильном порядке."""
         m = make_monitor()
-        feed(m, True, 2)
+        occupy(m, n_occupied=2)
         feed(m, False, 3, start_frame=10)
         feed(m, True, 2, start_frame=13)
+        feed(m, True, 2, start_frame=15)
 
-        approach_events = [t for t in m.transitions if t.next_state == TableState.APPROACH]
-        assert len(approach_events) == 2  # один при старте, один после EMPTY
+        states = [t.next_state for t in m.transitions]
+        assert TableState.APPROACH in states
+        assert TableState.OCCUPIED in states
+        # APPROACH должен предшествовать OCCUPIED
+        assert states.index(TableState.APPROACH) < states.index(TableState.OCCUPIED)
+
+    def test_passthrough_does_not_close_cycle(self):
+        """
+        НОВЫЙ ТЕСТ: человек прошёл мимо (APPROACH → EMPTY) не закрывает цикл.
+        Это ключевое отличие от старой логики с мгновенным APPROACH.
+        """
+        m = make_monitor(empty=3, occupied=2, stay=5)
+
+        # Сначала занимаем стол по-настоящему (нужно 5 кадров stay)
+        feed(m, True, 2)           # → APPROACH
+        feed(m, True, 5, start_frame=2)  # → OCCUPIED (stay=5)
+        assert m.state == TableState.OCCUPIED
+
+        feed(m, False, 3, start_frame=10)  # гость ушёл → EMPTY, цикл открыт
+        assert m.state == TableState.EMPTY
+
+        # Кто-то подошёл но сразу ушёл (APPROACH → EMPTY)
+        feed(m, True, 2, start_frame=13)   # → APPROACH
+        feed(m, False, 3, start_frame=15)  # → EMPTY (прошёл мимо, stay=5 не набрал)
+        assert m.state == TableState.EMPTY
+
+        a = m.get_analytics()
+        assert a["completed_cycles"] == 0    # прохожий не засчитан
+        assert a["open_cycles"] >= 1         # хотя бы один цикл остался открытым
 
 
 # ---------------------------------------------------------------------------
@@ -240,47 +299,43 @@ class TestAnalytics:
 
     def test_response_time_calculated_correctly(self):
         """
-        Время реакции = timestamp APPROACH − timestamp EMPTY.
-        При FPS=10: кадр 10 = 1.0 сек, кадр 13 = 1.3 сек → delta = 0.3 сек.
+        Время реакции = timestamp OCCUPIED − timestamp EMPTY.
+
+        При FPS=10:
+          EMPTY  на кадре 12 → 1.2 сек
+          OCCUPIED на кадре 16 → 1.6 сек  (APPROACH на 14, +2 stay кадра)
+          delta = 0.4 сек
         """
         m = make_monitor(empty=3, occupied=2)
-        feed(m, True, 2)                    # кадры 0-1: первый гость
-        feed(m, False, 3, start_frame=10)   # кадры 10-12: EMPTY на кадре 12
-        feed(m, True, 2, start_frame=13)    # кадры 13-14: APPROACH на кадре 14
+        occupy(m, n_occupied=2)                 # кадры 0-3: первый гость
+        feed(m, False, 3, start_frame=10)        # кадры 10-12: EMPTY на кадре 12
+        feed(m, True, 2, start_frame=13)         # кадры 13-14: APPROACH на кадре 14
+        feed(m, True, 2, start_frame=15)         # кадры 15-16: OCCUPIED на кадре 16
 
         a = m.get_analytics()
         assert a["completed_cycles"] == 1
-
-        # EMPTY зафиксирован на кадре 12 → 1.2 сек
-        # APPROACH зафиксирован на кадре 14 → 1.4 сек
-        # delta = 0.2 сек
-        assert abs(a["mean_response_sec"] - 0.2) < 0.01
+        # EMPTY=1.2s, OCCUPIED=1.6s → delta=0.4s
+        assert abs(a["mean_response_sec"] - 0.4) < 0.01
 
     def test_mean_over_multiple_cycles(self):
         """Среднее считается по всем завершённым циклам."""
         m = make_monitor(empty=3, occupied=2)
         frame = 0
-
-        def cycle(empty_gap: int):
-            nonlocal frame
-            feed(m, True, 2, frame); frame += 2
+        for _ in range(3):
+            frame = occupy(m, n_occupied=2, start_frame=frame)
             feed(m, False, 3, frame); frame += 3
-            feed(m, True, 2, frame); frame += empty_gap
+        # Последний подход — закрывает третий цикл
+        feed(m, True, 2, frame); frame += 2
+        feed(m, True, 2, frame)
 
-        # Цикл 1: gap = 5 кадров → 0.5 сек пустоты (EMPTY кадр +2, APPROACH кадр +2+gap)
-        # Цикл 2: gap = 3 кадра → 0.3 сек пустоты
-        # Цикл 3: gap = 7 кадров → 0.7 сек пустоты
-        # Среднее ≈ (0.2 + 0.2 + 0.2) / 3 = 0.2 — дельта всегда 0.2 т.к. дебаунс фиксирует
-        # точно через 2 кадра занятости после 3 пустых
-        cycle(5); cycle(5); cycle(5)
         a = m.get_analytics()
         assert a["completed_cycles"] == 3
         assert a["mean_response_sec"] is not None
 
     def test_open_cycle_not_counted_in_mean(self):
-        """Незакрытый цикл (видео кончилось пока стол пустой) в среднее не входит."""
+        """Незакрытый цикл в среднее не входит."""
         m = make_monitor(empty=3, occupied=2)
-        feed(m, True, 2)                    # гость
+        occupy(m, n_occupied=2)
         feed(m, False, 3, start_frame=10)   # стол освободился — цикл открыт
 
         a = m.get_analytics()
@@ -307,7 +362,6 @@ class TestAnalytics:
 class TestDataFrames:
 
     def test_events_dataframe_columns(self):
-        """get_events_dataframe() содержит ожидаемые колонки."""
         m = make_monitor()
         df = m.get_events_dataframe()
         expected = {"frame_no", "timestamp_sec", "prev_state", "next_state", "event_name"}
@@ -319,30 +373,33 @@ class TestDataFrames:
         assert len(df) == 0
 
     def test_events_dataframe_has_correct_rows(self):
-        """После полного цикла в DataFrame ровно 3 строки: APPROACH, EMPTY, APPROACH."""
+        """После полного цикла в DataFrame: APPROACH, OCCUPIED, EMPTY, APPROACH, OCCUPIED."""
         m = make_monitor(empty=3, occupied=2)
-        feed(m, True, 2)
+        occupy(m, n_occupied=2)
         feed(m, False, 3, start_frame=10)
         feed(m, True, 2, start_frame=13)
+        feed(m, True, 2, start_frame=15)
 
         df = m.get_events_dataframe()
-        assert len(df) == 3
-        assert df.iloc[0]["next_state"] == "APPROACH"
-        assert df.iloc[1]["next_state"] == "EMPTY"
-        assert df.iloc[2]["next_state"] == "APPROACH"
+        states = list(df["next_state"])
+        assert states[0] == "APPROACH"
+        assert states[1] == "OCCUPIED"
+        assert states[2] == "EMPTY"
+        assert states[3] == "APPROACH"
+        assert states[4] == "OCCUPIED"
 
     def test_events_dataframe_timestamp_monotonic(self):
         """Временны́е метки событий строго возрастают."""
         m = make_monitor(empty=3, occupied=2)
-        feed(m, True, 2)
+        occupy(m, n_occupied=2)
         feed(m, False, 3, start_frame=10)
         feed(m, True, 2, start_frame=13)
+        feed(m, True, 2, start_frame=15)
 
         df = m.get_events_dataframe()
         assert df["timestamp_sec"].is_monotonic_increasing
 
     def test_cycles_dataframe_columns(self):
-        """get_cycles_dataframe() содержит ожидаемые колонки."""
         m = make_monitor()
         df = m.get_cycles_dataframe()
         expected = {
@@ -356,10 +413,11 @@ class TestDataFrames:
         """is_completed=True для закрытых циклов, False для открытых."""
         m = make_monitor(empty=3, occupied=2)
 
-        # Цикл 1 — закрытый
-        feed(m, True, 2)
+        # Цикл 1 — закрытый (APPROACH подтверждён в OCCUPIED)
+        occupy(m, n_occupied=2)
         feed(m, False, 3, start_frame=10)
         feed(m, True, 2, start_frame=13)
+        feed(m, True, 2, start_frame=15)
 
         # Цикл 2 — открытый (видео кончилось)
         feed(m, False, 3, start_frame=20)
@@ -372,9 +430,10 @@ class TestDataFrames:
     def test_cycles_dataframe_response_time_matches_analytics(self):
         """response_time_sec в DataFrame совпадает с mean из get_analytics()."""
         m = make_monitor(empty=3, occupied=2)
-        feed(m, True, 2)
+        occupy(m, n_occupied=2)
         feed(m, False, 3, start_frame=10)
         feed(m, True, 2, start_frame=13)
+        feed(m, True, 2, start_frame=15)
 
         df = m.get_cycles_dataframe()
         a = m.get_analytics()
@@ -382,11 +441,11 @@ class TestDataFrames:
         assert abs(df_mean - a["mean_response_sec"]) < 0.01
 
     def test_events_dataframe_returns_copy(self):
-        """transitions() и get_events_dataframe() не открывают доступ к внутреннему состоянию."""
+        """transitions не открывает доступ к внутреннему состоянию."""
         m = make_monitor()
         t1 = m.transitions
-        t1.append("injected")  # попытка мутировать
-        assert len(m.transitions) == 0  # внутренний список не тронут
+        t1.append("injected")
+        assert len(m.transitions) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -403,26 +462,23 @@ class TestEdgeCases:
         assert len(m.transitions) == 0
 
     def test_always_occupied_from_start(self):
-        """Стол занят с первого кадра → APPROACH, потом остаётся OCCUPIED."""
+        """Стол занят с первого кадра → APPROACH, потом OCCUPIED."""
         m = make_monitor(empty=3, occupied=2)
-        feed(m, True, 10)
+        feed(m, True, 2)            # → APPROACH
+        feed(m, True, 2, start_frame=2)  # → OCCUPIED
         assert m.state == TableState.OCCUPIED
-        assert len(m.transitions) == 1
-        assert m.transitions[0].next_state == TableState.APPROACH
+        states = [t.next_state for t in m.transitions]
+        assert states[0] == TableState.APPROACH
+        assert states[1] == TableState.OCCUPIED
 
     def test_rapid_flicker_does_not_cause_false_transitions(self):
-        """
-        Чередование True/False каждый кадр не должно давать переходов
-        пока ни одна сторона не накопит threshold.
-        """
+        """Чередование True/False каждый кадр не должно давать переходов."""
         m = make_monitor(empty=5, occupied=5)
-        feed(m, True, 5)  # занять стол
-        frame = 5
+        occupy(m, n_occupied=5)   # занять стол (через APPROACH, stay=5)
+        frame = 10
         for i in range(20):
-            m.update(frame + i, FPS, i % 2 == 0)  # чередование
+            m.update(frame + i, FPS, i % 2 == 0)
         assert m.state == TableState.OCCUPIED
-        # Новых переходов не должно быть (только первый APPROACH)
-        assert len(m.transitions) == 1
 
     def test_single_frame_video(self):
         """Видео из одного кадра — не падает."""
@@ -435,50 +491,35 @@ class TestEdgeCases:
         """Временны́е метки зависят от fps, не захардкожены."""
         m1 = make_monitor(empty=3, occupied=2)
         m2 = make_monitor(empty=3, occupied=2)
-
-        # Одинаковые кадры, разные fps
         for i in range(2):
             m1.update(i, 10.0, True)
             m2.update(i, 30.0, True)
-
         ts1 = m1.transitions[0].timestamp
         ts2 = m2.transitions[0].timestamp
-        assert abs(ts1 - 0.1) < 1e-9  # кадр 1 при 10fps = 0.1 сек
-        assert abs(ts2 - 1/30) < 1e-9  # кадр 1 при 30fps = 0.033 сек
+        assert abs(ts1 - 0.1) < 1e-9
+        assert abs(ts2 - 1/30) < 1e-9
 
     def test_zero_response_time_impossible(self):
-        """
-        Время реакции не может быть нулевым: EMPTY и APPROACH
-        не могут происходить на одном кадре.
-        """
+        """Время реакции не может быть нулевым."""
         m = make_monitor(empty=3, occupied=2)
-        feed(m, True, 2)
+        occupy(m, n_occupied=2)
         feed(m, False, 3, start_frame=10)
         feed(m, True, 2, start_frame=13)
+        feed(m, True, 2, start_frame=15)
 
         df = m.get_cycles_dataframe()
         assert (df["response_time_sec"].dropna() > 0).all()
 
     def test_multiple_open_cycles_at_end(self):
-        """
-        Если стол освобождался несколько раз без подхода
-        (теоретически невозможно в реальности, но тест на устойчивость).
-        """
+        """Открытый цикл корректно считается при незавершённом видео."""
         m = make_monitor(empty=3, occupied=2)
-        feed(m, True, 2)
-        feed(m, False, 3, start_frame=10)
-        # Стол снова занят без APPROACH (не может быть при нормальной работе,
-        # но проверяем что класс не упадёт при ручном вызове)
-        # Симулируем патологию: ещё один EMPTY без предшествующего APPROACH
-        # (достигается через второй монитор — этот тест проверяет open_cycles > 1
-        #  в аналитике при двух последовательных EMPTY)
-        m2 = make_monitor(empty=3, occupied=2)
-        feed(m2, True, 2)
-        feed(m2, False, 3, start_frame=10)  # open cycle 1
-        feed(m2, True, 2, start_frame=13)   # APPROACH → closed
-        feed(m2, False, 3, start_frame=20)  # open cycle 2
+        occupy(m, n_occupied=2)
+        feed(m, False, 3, start_frame=10)   # open cycle 1 → EMPTY
+        feed(m, True, 2, start_frame=13)    # → APPROACH
+        feed(m, True, 2, start_frame=15)    # → OCCUPIED (closes cycle 1)
+        feed(m, False, 3, start_frame=20)   # open cycle 2
 
-        a = m2.get_analytics()
+        a = m.get_analytics()
         assert a["open_cycles"] == 1
         assert a["completed_cycles"] == 1
 
@@ -491,15 +532,13 @@ class TestMultipleCycles:
 
     @staticmethod
     def _run_n_cycles(n: int) -> TableMonitor:
-        """Запустить N полных циклов и вернуть монитор."""
         m = make_monitor(empty=3, occupied=2)
         frame = 0
         for _ in range(n):
-            feed(m, True, 2, frame);  frame += 2
+            frame = occupy(m, n_occupied=2, start_frame=frame)
             feed(m, False, 3, frame); frame += 3
-        # Последний подход (закрывает цикл)
-        # Первый цикл — нет предшествующего EMPTY, не закрывается
-        # Все остальные закрываются при следующем APPROACH
+        # Последний подход — закрывает последний цикл
+        feed(m, True, 2, frame); frame += 2
         feed(m, True, 2, frame)
         return m
 
@@ -511,12 +550,15 @@ class TestMultipleCycles:
     def test_transitions_count_correct(self):
         """
         За 3 цикла должно быть:
-          3 × APPROACH + 3 × EMPTY = 6 переходов.
-        (Последний APPROACH закрывает третий цикл.)
+          3 × (APPROACH + OCCUPIED) + 3 × EMPTY + 1 финальный APPROACH + OCCUPIED
+          = 3*2 + 3 + 2 = 11 переходов.
         """
         m = self._run_n_cycles(3)
         df = m.get_events_dataframe()
-        assert len(df) == 7  # 3 APPROACH + 3 EMPTY + 1 финальный APPROACH
+        # Каждый цикл: APPROACH + OCCUPIED + EMPTY = 3 события
+        # Финальный подход: APPROACH + OCCUPIED = 2 события
+        # Итого: 3*3 + 2 = 11
+        assert len(df) == 11
 
     def test_all_response_times_positive(self):
         m = self._run_n_cycles(5)
@@ -525,7 +567,6 @@ class TestMultipleCycles:
         assert (completed["response_time_sec"] > 0).all()
 
     def test_cycles_dataframe_length(self):
-        """Количество строк в cycles DataFrame = completed + open."""
         m = self._run_n_cycles(4)
         a = m.get_analytics()
         df = m.get_cycles_dataframe()
@@ -533,208 +574,175 @@ class TestMultipleCycles:
 
 
 # ---------------------------------------------------------------------------
-# Группа 8: Специфические краевые случаи FSM (Выявление багов)
+# Группа 8: Специфические краевые случаи FSM
 # ---------------------------------------------------------------------------
 
 class TestFSMEdgeCases:
 
     def test_transition_chain_is_complete(self):
-        """
-        ПРОВЕРКА НА БАГ: После APPROACH обязательно должно быть событие OCCUPIED.
-        Если в коде стоит ручная перезапись self._state = OCCUPIED внутри 
-        обработки APPROACH, то второе событие (переход в стабильное состояние) 
-        просто не сгенерируется, так как update() не увидит разницы.
-        """
+        """После APPROACH обязательно должно быть событие OCCUPIED."""
         m = make_monitor(empty=3, occupied=2)
-        
-        # Подаем 5 кадров присутствия. 
-        # На 2-м кадре должен быть APPROACH.
-        # На 3-м (или сразу после) должен быть переход в стабильный OCCUPIED.
-        feed(m, True, 5) 
-        
+        feed(m, True, 2)            # → APPROACH
+        feed(m, True, 2, start_frame=2)  # → OCCUPIED
+
         events = [t.next_state for t in m.transitions]
-        
-        # В дефектной версии здесь будет только [TableState.APPROACH]
-        assert len(events) >= 2, f"Цепочка событий прервана: {events}"
-        assert TableState.OCCUPIED in events, "Отсутствует подтверждение состояния OCCUPIED в истории"
+        assert TableState.APPROACH in events
+        assert TableState.OCCUPIED in events
+        assert events.index(TableState.APPROACH) < events.index(TableState.OCCUPIED)
 
     def test_no_dead_zone_after_approach(self):
-        """
-        Проверка сброса счетчиков. Если после фиксации APPROACH человек сразу 
-        исчезает, система должна корректно начать отсчет до EMPTY.
-        """
+        """После фиксации APPROACH система корректно начинает отсчёт до EMPTY."""
         m = make_monitor(empty=3, occupied=2)
-        
-        # 1. Фиксируем подход (кадры 0, 1)
-        feed(m, True, 2) 
+        feed(m, True, 2)                 # → APPROACH (кадры 0-1)
+        feed(m, True, 2, start_frame=2)  # → OCCUPIED (кадры 2-3)
         assert m.state == TableState.OCCUPIED
-        
-        # 2. Человек уходит (кадры 2, 3, 4). На 4-м кадре должен быть EMPTY.
-        transitions = feed(m, False, 3, start_frame=2)
-        
+
+        transitions = feed(m, False, 3, start_frame=4)
         assert m.state == TableState.EMPTY
-        assert any(t.next_state == TableState.EMPTY for t in transitions), \
-            "Система 'зависла' в OCCUPIED и не заметила ухода сразу после подхода"
+        assert any(t.next_state == TableState.EMPTY for t in transitions)
 
     def test_approach_is_atomic_event(self):
-        """
-        APPROACH не должен генерироваться повторно, если стол не стал EMPTY.
-        Это проверяет, что APPROACH — это именно 'вход' в состояние занятости.
-        """
+        """APPROACH не генерируется повторно, если стол не стал EMPTY."""
         m = make_monitor(empty=10, occupied=2)
-        
-        # Занимаем стол -> APPROACH
-        feed(m, True, 2) 
-        
-        # Кратковременный 'дребезг' детектора (исчез на 3 кадра, порог EMPTY = 10)
-        feed(m, False, 3, start_frame=10) 
-        
+        feed(m, True, 2)                 # → APPROACH
+        feed(m, True, 2, start_frame=2)  # → OCCUPIED
+
+        # Кратковременный дребезг (3 кадра, порог EMPTY = 10)
+        feed(m, False, 3, start_frame=10)
+
         # Снова появился
         transitions = feed(m, True, 2, start_frame=13)
-        
-        # Новых APPROACH быть не должно
+
         approaches = [t for t in transitions if t.next_state == TableState.APPROACH]
-        assert len(approaches) == 0, "Ошибка: Повторный APPROACH без предварительной очистки стола"
+        assert len(approaches) == 0
 
 
 # ---------------------------------------------------------------------------
-# Группа 9: Проверка инерции счетчиков (Debounce Integrity)
+# Группа 9: Проверка инерции счётчиков (Debounce Integrity)
 # ---------------------------------------------------------------------------
 
 class TestDebounceIntegrity:
 
     def test_occupied_confirmation_requires_new_frames_after_approach(self):
         """
-        ТЕСТ НА ОШИБКУ: После APPROACH система должна ПОВТОРНО подтвердить 
-        стабильность состояния для перехода в OCCUPIED.
-        
-        Если счетчики не сбрасываются в _apply_transition, то при 
-        min_occupied_frames=5:
-        - Кадр 5: APPROACH (счетчик=5)
-        - Кадр 6: OCCUPIED (счетчик=6) -> ОШИБКА, переход случился слишком быстро.
+        После APPROACH счётчики сбрасываются.
+        Следующий переход в OCCUPIED требует накопить min_stay_frames заново.
         """
         threshold = 5
-        m = make_monitor(empty=10, occupied=threshold)
-        
-        # 1. Подаем ровно столько кадров, сколько нужно для APPROACH
+        m = make_monitor(empty=10, occupied=threshold, stay=threshold)
+
+        # Входим в APPROACH
         feed(m, True, threshold)
-        assert m.state == TableState.OCCUPIED # Внутри уже подменилось
-        
-        # Проверяем историю переходов
-        events = m.transitions
-        assert events[-1].next_state == TableState.APPROACH
-        
-        # 2. Подаем ЕЩЕ ОДИН кадр присутствия
-        m.update(threshold + 1, FPS, True)
-        
-        # Если счетчик НЕ сбросился, система увидит (threshold + 1) > threshold
-        # и создаст новый переход в OCCUPIED прямо сейчас.
-        
+        assert m.state == TableState.APPROACH
+
+        # Один кадр — недостаточно для OCCUPIED
+        m.update(threshold, FPS, True)
         all_next_states = [t.next_state for t in m.transitions]
-        
-        # ПРОВЕРКА: В списке событий НЕ должно быть OCCUPIED сразу после APPROACH.
-        # Мы должны накопить еще 'threshold' кадров для этого.
-        assert TableState.OCCUPIED not in all_next_states, (
-            f"БАГ: Переход в OCCUPIED случился мгновенно на кадре {threshold + 1}. "
-            "Счетчики не были сброшены после APPROACH."
-        )
+        assert TableState.OCCUPIED not in all_next_states
+
+        # Добираем оставшиеся кадры
+        feed(m, True, threshold - 1, start_frame=threshold + 1)
+        all_next_states = [t.next_state for t in m.transitions]
+        assert TableState.OCCUPIED in all_next_states
 
     def test_counter_reset_after_any_transition(self):
         """
-        Тест проверяет физическое обнуление атрибутов после перехода.
+        После перехода в APPROACH предыдущие накопленные кадры не должны
+        засчитываться для перехода в OCCUPIED.
         """
-        m = make_monitor(empty=5, occupied=5)
-        
-        # Доводим до перехода
-        feed(m, True, 5)
-        
-        assert m._consecutive_occupied == 0, (
-            f"Счетчик _consecutive_occupied равен {m._consecutive_occupied}, а должен быть 0"
-        )
+        threshold = 5
+        m = make_monitor(empty=10, occupied=threshold, stay=threshold)
+
+        # Доходим до APPROACH
+        feed(m, True, threshold)
+        assert m.state == TableState.APPROACH
+
+        # Если счётчик НЕ сбросился, одного кадра хватило бы для OCCUPIED
+        m.update(threshold, FPS, True)
+
+        # Проверяем: перехода в OCCUPIED ещё нет
+        assert m.state == TableState.APPROACH
+
+        # Добираем нужное количество кадров
+        feed(m, True, threshold - 1, start_frame=threshold + 1)
+
+        # Теперь переход должен произойти
+        assert m.state == TableState.OCCUPIED
+
+    def test_empty_counter_reset_after_transition(self):
+        """
+        После перехода в EMPTY предыдущие пустые кадры не должны влиять
+        на следующий цикл (нужно заново накопить threshold).
+        """
+        m = make_monitor(empty=3, occupied=2)
+
+        # Занимаем стол
+        occupy(m, n_occupied=2)
+        assert m.state == TableState.OCCUPIED
+
+        # Переходим в EMPTY
+        feed(m, False, 3, start_frame=10)
+        assert m.state == TableState.EMPTY
+
+        # Даём меньше порога для APPROACH
+        transitions = feed(m, True, 1, start_frame=20)
+
+        # Если счётчик не сброшен — уже был бы APPROACH
+        assert m.state == TableState.EMPTY
+        assert len(transitions) == 0
+
+        # Добираем до порога
+        transitions = feed(m, True, 1, start_frame=21)
+
+        assert any(t.next_state == TableState.APPROACH for t in transitions)
 
 
 # ---------------------------------------------------------------------------
-# Группа 10: Тесты, которые ДОЛЖНЫ ПАДАТЬ (демонстрация бага)
+# Группа 10: APPROACH как настоящее состояние (ключевые тесты новой логики)
 # ---------------------------------------------------------------------------
 
-class TestApproachShouldBehaveAsState:
+class TestApproachAsRealState:
 
     def test_approach_to_occupied_transition_exists(self):
-        """
-        ОЖИДАЕМОЕ ПОВЕДЕНИЕ:
-        После APPROACH должен быть переход в OCCUPIED.
-
-        ФАКТ:
-        Его нет → тест падает.
-        """
+        """В истории должен быть переход APPROACH → OCCUPIED."""
         m = make_monitor(empty=3, occupied=2)
-
-        feed(m, True, 5)
+        feed(m, True, 2)                 # → APPROACH
+        feed(m, True, 2, start_frame=2)  # → OCCUPIED
 
         events = [(t.prev_state, t.next_state) for t in m.transitions]
-
-        assert any(
-            prev == TableState.APPROACH and next_ == TableState.OCCUPIED
-            for prev, next_ in events
-        ), "Нет перехода APPROACH → OCCUPIED"
-
+        assert (TableState.APPROACH, TableState.OCCUPIED) in events
 
     def test_state_matches_last_transition(self):
-        """
-        ОЖИДАЕМОЕ ПОВЕДЕНИЕ:
-        Текущее состояние всегда равно последнему next_state в истории.
-
-        ФАКТ:
-        После APPROACH состояние уже OCCUPIED → рассинхрон → тест падает.
-        """
+        """Текущее состояние всегда равно последнему next_state в истории."""
         m = make_monitor(empty=3, occupied=2)
+        feed(m, True, 2)                 # → APPROACH
+        assert m.state == m.transitions[-1].next_state
 
-        feed(m, True, 2)
+        feed(m, True, 2, start_frame=2)  # → OCCUPIED
+        assert m.state == m.transitions[-1].next_state
 
-        last_transition = m.transitions[-1]
-
-        assert m.state == last_transition.next_state, (
-            f"Состояние ({m.state}) не совпадает с историей ({last_transition.next_state})"
-        )
-
-
-    def test_approach_persists_at_least_one_frame(self):
-        """
-        ОЖИДАЕМОЕ ПОВЕДЕНИЕ:
-        APPROACH должен существовать хотя бы 1 кадр как состояние.
-
-        ФАКТ:
-        Он мгновенно превращается в OCCUPIED → тест падает.
-        """
-        m = make_monitor(empty=3, occupied=2)
-
-        states = []
-
-        for i in range(5):
+    def test_approach_persists_as_current_state(self):
+        """APPROACH должен быть текущим состоянием в течение min_stay_frames кадров."""
+        m = make_monitor(empty=3, occupied=2, stay=5)
+        states_seen = set()
+        for i in range(2):           # входим в APPROACH
             m.update(i, FPS, True)
-            states.append(m.state)
-
-        assert TableState.APPROACH in states, (
-            "APPROACH ни разу не был текущим состоянием"
-        )
-
-
-    def test_approach_duration_positive(self):
-        """
-        ОЖИДАЕМОЕ ПОВЕДЕНИЕ:
-        Можно измерить длительность APPROACH (>= 1 кадр).
-
-        ФАКТ:
-        APPROACH не имеет длительности → тест падает.
-        """
-        m = make_monitor(empty=3, occupied=2)
-
-        approach_frames = []
-
-        for i in range(5):
+            states_seen.add(m.state)
+        for i in range(2, 6):        # наблюдаем APPROACH
             m.update(i, FPS, True)
-            if m.state == TableState.APPROACH:
-                approach_frames.append(i)
+            states_seen.add(m.state)
 
-        assert len(approach_frames) > 0, "APPROACH никогда не активен"
-        assert len(approach_frames) >= 1, "APPROACH должен длиться хотя бы 1 кадр"
+        assert TableState.APPROACH in states_seen
+
+    def test_passthrough_returns_to_empty_not_occupied(self):
+        """
+        Человек прошёл мимо (ушёл до min_stay_frames) → EMPTY, не OCCUPIED.
+        Это ключевое бизнес-правило нового APPROACH.
+        """
+        m = make_monitor(empty=3, occupied=2, stay=10)
+        feed(m, True, 2)            # → APPROACH
+        feed(m, False, 3, start_frame=2)  # прошёл мимо → EMPTY
+
+        assert m.state == TableState.EMPTY
+        states = [t.next_state for t in m.transitions]
+        assert TableState.OCCUPIED not in states

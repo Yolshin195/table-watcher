@@ -313,9 +313,9 @@ class TableMonitor:
 
     def __init__(
         self,
-        min_empty_frames:    int = 30,
-        min_occupied_frames: int = 5,
-        min_stay_frames:     int = 15,
+        min_empty_frames:    int = 90,
+        min_occupied_frames: int = 15,
+        min_stay_frames:     int = 150,
     ):
         self._ctx = _MonitorContext(
             min_empty_frames=min_empty_frames,
