@@ -26,6 +26,8 @@ import logging
 import sys
 from pathlib import Path
 
+from utils.roi_manager import ROIManager
+
 
 # ---------------------------------------------------------------------------
 # Настройка логирования — до любых других импортов
@@ -300,10 +302,15 @@ def main() -> None:
     log.info("Модель:  %s  (confidence=%.2f  step=%d)", args.model, args.confidence, args.step)
     log.info("FSM:     empty_frames=%d  occupied_frames=%d",
              args.empty_frames, args.occupied_frames)
-    if roi:
-        log.info("ROI:     x=%d y=%d w=%d h=%d", *roi)
+
+    # 2. Логика определения ROI
+    if args.roi:
+        # Если пользователь явно передал --roi в консоли, используем его
+        roi = tuple(args.roi)
     else:
-        log.info("ROI:     интерактивный выбор")
+        # Если не передал — делегируем менеджеру (он поищет в JSON или спросит)
+        roi_manager = ROIManager(config_path="settings/table_config.json")
+        roi = roi_manager.get_roi(args.video)
 
     processor = VideoProcessor(
         video_path=args.video,
