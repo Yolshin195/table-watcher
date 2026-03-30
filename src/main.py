@@ -27,6 +27,7 @@ import sys
 from pathlib import Path
 
 from utils.roi_manager import ROIManager
+from utils.session_dir import get_session_dir
 
 
 # ---------------------------------------------------------------------------
@@ -77,6 +78,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     # --- Выходные файлы ---
+    parser.add_argument(
+        "--output-path",
+        metavar="DIR",
+        default="outputs",
+        help="Корневая папка для всех запусков (default: outputs)."
+    )
     parser.add_argument(
         "--output", "-o",
         metavar="PATH",
@@ -236,7 +243,7 @@ def _validate(args: argparse.Namespace) -> None:
 # Сборка плагинов согласно аргументам
 # ---------------------------------------------------------------------------
 
-def _build_plugins(args: argparse.Namespace) -> list:
+def _build_plugins(args: argparse.Namespace, output_path: Path) -> list:
     from plugins import (
         RoiOverlayPlugin,
         EventLoggerPlugin,
@@ -274,16 +281,16 @@ def _build_plugins(args: argparse.Namespace) -> list:
 
     # Скриншоты в момент событий
     if args.snapshots:
-        plugins.append(SnapshotPlugin(output_dir=args.snapshots))
+        plugins.append(SnapshotPlugin(output_path=output_path))
 
     # Текстовый отчёт
     plugins.append(ReportPlugin(
-        output_path=args.report,
+        output_path=output_path,
         video_path=args.video,
     ))
 
     # Генерации финального аналитического графика.
-    plugins.append(TimelineChartPlugin())
+    plugins.append(TimelineChartPlugin(output_path=output_path))
 
     return plugins
 
@@ -313,10 +320,11 @@ def main() -> None:
         min_stay_frames=args.stay_frames,
     )
 
-    plugins = _build_plugins(args)
+    output_path = get_session_dir(args.output_path, args.video)
+    plugins = _build_plugins(args, output_path)
 
     # В фоновом режиме output не пишем
-    output_path = None if args.no_overlay else args.output
+    output_video = None if args.no_overlay else output_path / args.output
 
     log.info("Видео:   %s", args.video)
     log.info("Модель:  %s  (confidence=%.2f  step=%d)", args.model, args.confidence, args.step)
@@ -338,7 +346,7 @@ def main() -> None:
         monitor=monitor,
         plugins=plugins,
         confidence_threshold=args.confidence,
-        output_path=output_path,
+        output_path=output_video,
         model_name=args.model,
         detection_step=args.step,
     )

@@ -249,8 +249,8 @@ class SnapshotPlugin(BasePlugin):
     Файлы: {output_dir}/frame_{frame_no:06d}_{event}.png
     """
 
-    def __init__(self, output_dir: str = "snapshots"):
-        self.output_dir = Path(output_dir)
+    def __init__(self, output_path: Optional[Path | str] = None):
+        self.output_dir = Path(output_path or ".") / "snapshots"
 
     def on_start(self, total_frames: int, fps: float, roi: tuple) -> None:
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -290,8 +290,8 @@ class ReportPlugin(BasePlugin):
         00:01:47.10  EMPTY    → APPROACH  (+23.7s)
     """
 
-    def __init__(self, output_path: str = "report.txt", video_path: str = ""):
-        self.output_path = Path(output_path)
+    def __init__(self, output_path: Optional[Path | str] = None, video_path: str = ""):
+        self.output_path = Path(output_path or ".") / "report.txt"
         self.video_path  = video_path
         self._roi: Optional[tuple] = None
 
@@ -524,8 +524,8 @@ class TimelineChartPlugin(BasePlugin):
     Рисует хронологию переходов и выводит среднее время реакции.
     """
 
-    def __init__(self, output_dir: str = "reports", filename: str = "timeline.png"):
-        self.output_dir = Path(output_dir)
+    def __init__(self, output_path: Optional[Path], filename: str = "timeline.png"):
+        self.output_dir = Path(output_path or ".")
         self.filename = filename
         
         # Цвета для matplotlib (совпадают по логике с основной системой)
