@@ -25,8 +25,8 @@ import cv2
 import numpy as np
 import matplotlib.pyplot as plt
 
-from table_monitor import TableMonitor, TableState
-from video_processor import BasePlugin, FrameContext
+from src.table_monitor import TableMonitor, TableState
+from src.video_processor import BasePlugin, FrameContext
 
 logger = logging.getLogger(__name__)
 
@@ -520,16 +520,14 @@ class TimelinePlugin(BasePlugin):
 class TimelineChartPlugin(BasePlugin):
     """
     Плагин для генерации финального аналитического графика.
-    
-    Использует данные из TableMonitor после завершения обработки видео.
-    Рисует хронологию переходов и выводит среднее время реакции.
+    Теперь рисует непрерывную ступенчатую линию с цветовой заливкой.
     """
 
     def __init__(self, output_path: Optional[Path], filename: str = "timeline.png"):
         self.output_dir = Path(output_path or ".")
         self.filename = filename
         
-        # Цвета для matplotlib (совпадают по логике с основной системой)
+        # Цвета для matplotlib
         self._colors_hex = {
             TableState.EMPTY:    '#00C800',  # Зеленый
             TableState.OCCUPIED: '#DC0000',  # Красный
@@ -558,31 +556,36 @@ class TimelineChartPlugin(BasePlugin):
         # Подготовка фигуры
         plt.figure(figsize=(15, 6))
         
-        # Рисуем точки для каждого состояния из колонки 'next_state'
-        # В вашем мониторе это зафиксированные переходы (StateTransition)
-        unique_states = df['next_state'].unique()
+        # --- НОВАЯ ЛОГИКА ОТРИСОВКИ ---
         
-        for state_name in unique_states:
-            subset = df[df['next_state'] == state_name]
+        # 1. Рисуем саму линию переходов (ступенчатую)
+        # drawstyle='steps-post' гарантирует, что состояние "держится" до следующей точки
+        plt.plot(
+            df['timestamp_sec'], 
+            df['next_state'], 
+            drawstyle='steps-post', 
+            color='#333333', 
+            linewidth=2, 
+            zorder=4,
+            label='Линия состояний'
+        )
+
+        # 2. Заливка цветом интервалов
+        for i in range(len(df) - 1):
+            t_start = df.iloc[i]['timestamp_sec']
+            t_end = df.iloc[i+1]['timestamp_sec']
+            state_name = df.iloc[i]['next_state']
             
-            # Получаем цвет через Enum (state_name там строка, например 'OCCUPIED')
             try:
                 state_enum = TableState[state_name]
                 color = self._colors_hex.get(state_enum, 'gray')
             except KeyError:
                 color = 'gray'
-            
-            plt.scatter(
-                subset['timestamp_sec'], 
-                [state_name] * len(subset), 
-                c=color, 
-                label=state_name, 
-                s=30, 
-                marker='|',
-                zorder=3
-            )
+                
+            plt.axvspan(t_start, t_end, color=color, alpha=0.3, zorder=2)
 
-        # Формируем заголовок с аналитикой
+        # --- КОНЕЦ НОВОЙ ЛОГИКИ ---
+
         mean_val = analytics.get('mean_response_sec')
         title_text = "Хронология состояний столика"
         if mean_val:
@@ -592,10 +595,9 @@ class TimelineChartPlugin(BasePlugin):
         plt.xlabel("Время видео (секунды)", fontsize=12)
         plt.ylabel("Состояние", fontsize=12)
         
-        # Сетка и оформление
-        plt.grid(axis='x', linestyle='--', alpha=0.6)
-        plt.yticks(unique_states)
-        plt.legend(frameon=True, loc='upper right')
+        plt.grid(axis='both', linestyle='--', alpha=0.4)
+        # Важно оставить yticks, чтобы на оси были названия состояний
+        plt.yticks(df['next_state'].unique())
         
         plt.tight_layout()
         

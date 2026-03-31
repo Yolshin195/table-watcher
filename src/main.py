@@ -26,8 +26,8 @@ import logging
 import sys
 from pathlib import Path
 
-from utils.roi_manager import ROIManager
-from utils.session_dir import get_session_dir
+from src.utils.roi_manager import ROIManager
+from src.utils.session_dir import get_session_dir
 
 
 # ---------------------------------------------------------------------------
@@ -244,10 +244,9 @@ def _validate(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 def _build_plugins(args: argparse.Namespace, output_path: Path) -> list:
-    from plugins import (
+    from src.plugins import (
         RoiOverlayPlugin,
         EventLoggerPlugin,
-        ProgressPlugin,
         SnapshotPlugin,
         ReportPlugin,
         TimelinePlugin,
@@ -268,7 +267,7 @@ def _build_plugins(args: argparse.Namespace, output_path: Path) -> list:
 
     # Live-просмотр — подключается ПОСЛЕ overlay, чтобы видеть отрисовку
     if args.live:
-        from plugins import LiveViewPlugin
+        from src.plugins import LiveViewPlugin
         plugins.append(LiveViewPlugin(scale=args.scale))
 
     # Прогресс-бар
@@ -309,8 +308,8 @@ def main() -> None:
     log = logging.getLogger(__name__)
 
     # Импортируем тяжёлые зависимости после валидации
-    from table_monitor import TableMonitor
-    from video_processor import VideoProcessor
+    from src.table_monitor import TableMonitor
+    from src.video_processor import VideoProcessor
 
     roi = tuple(args.roi) if args.roi else None
 

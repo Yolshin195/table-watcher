@@ -21,7 +21,7 @@ from typing import Optional
 import cv2
 import numpy as np
 
-from table_monitor import TableMonitor, TableState, StateTransition, ProgressSnapshot
+from src.table_monitor import TableMonitor, TableState, StateTransition, ProgressSnapshot
 
 logger = logging.getLogger(__name__)
 
