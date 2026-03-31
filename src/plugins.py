@@ -927,7 +927,7 @@ class IntervalAnalyticsPlugin(BasePlugin):
         """
         pass
 
-    def on_process_finished(self, monitor: 'TableMonitor'):
+    def on_finish(self, monitor: TableMonitor) -> None:
         # 1. Получаем все интервалы (включая текущий активный)
         df = monitor.get_intervals_dataframe()
         if df.empty:
@@ -1012,7 +1012,7 @@ class CsvIntervalExportPlugin(BasePlugin):
         """
         pass
 
-    def on_process_finished(self, monitor: TableMonitor):
+    def on_finish(self, monitor: TableMonitor) -> None:
         """
         Вызывается один раз в конце обработки видео.
         Забирает данные из внутреннего контекста монитора через публичный метод.

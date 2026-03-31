@@ -79,7 +79,6 @@ class BasePlugin(abc.ABC):
         on_frame()  — вызывается на каждом кадре
         on_finish() — вызывается после последнего кадра (или при ошибке)
     """
-
     def on_start(self, total_frames: int, fps: float, roi: tuple) -> None:
         """Инициализация плагина. Вызывается до начала обработки."""
         pass
@@ -229,7 +228,10 @@ class VideoProcessor:
 
                 # --- Плагины рисуют / логируют ---
                 for plugin in self._plugins:
-                    plugin.on_frame(ctx)
+                    try:
+                        plugin.on_frame(ctx)
+                    except Exception as e:
+                        logger.error(f"Ошибка в плагине {plugin.__class__.__name__}: {e}")
 
                 # --- Пишем кадр в файл (уже с отрисовкой плагинов) ---
                 if writer is not None:
@@ -246,7 +248,10 @@ class VideoProcessor:
 
         # Финализируем плагины
         for plugin in self._plugins:
-            plugin.on_finish(self.monitor)
+            try:
+                plugin.on_finish(self.monitor)
+            except Exception as e:
+                logger.error(f"Ошибка в плагине {plugin.__class__.__name__}: {e}")
 
         return self.monitor
 

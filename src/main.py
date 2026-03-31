@@ -272,6 +272,22 @@ def _build_plugins(args: argparse.Namespace, output_path: Path) -> list:
         from src.plugins import LiveViewPlugin
         plugins.append(LiveViewPlugin(scale=args.scale))
 
+    # Скриншоты в момент событий
+    if args.snapshots:
+        plugins.append(SnapshotPlugin(output_path=output_path))
+
+    plugins.append(IntervalAnalyticsPlugin(output_path=output_path))
+    plugins.append(CsvIntervalExportPlugin(output_path=output_path))
+
+    # Текстовый отчёт
+    plugins.append(ReportPlugin(
+        output_path=output_path,
+        video_path=args.video,
+    ))
+
+    # Генерации финального аналитического графика.
+    plugins.append(TimelineChartPlugin(output_path=output_path))
+
     # Прогресс-бар
     if not args.no_progress:
         plugins.append(UnifiedHistoryLogger())
@@ -279,22 +295,6 @@ def _build_plugins(args: argparse.Namespace, output_path: Path) -> list:
         #Если прогресс бар не запущен лог событий FSM в консоль
         plugins.append(EventLoggerPlugin())
     
-
-    # Скриншоты в момент событий
-    if args.snapshots:
-        plugins.append(SnapshotPlugin(output_path=output_path))
-
-    # Текстовый отчёт
-    plugins.append(ReportPlugin(
-        output_path=output_path,
-        video_path=args.video,
-    ))
-    plugins.append(IntervalAnalyticsPlugin(output_path=output_path))
-    plugins.append(CsvIntervalExportPlugin(output_path=output_path))
-
-    # Генерации финального аналитического графика.
-    plugins.append(TimelineChartPlugin(output_path=output_path))
-
     return plugins
 
 
