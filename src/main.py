@@ -254,6 +254,8 @@ def _build_plugins(args: argparse.Namespace, output_path: Path) -> list:
         PeopleVisualizerPlugin,
         TableProgressBarPlugin,
         UnifiedHistoryLogger,
+        IntervalAnalyticsPlugin,
+        CsvIntervalExportPlugin,
     )
 
     plugins = []
@@ -287,6 +289,8 @@ def _build_plugins(args: argparse.Namespace, output_path: Path) -> list:
         output_path=output_path,
         video_path=args.video,
     ))
+    plugins.append(IntervalAnalyticsPlugin(output_path=output_path))
+    plugins.append(CsvIntervalExportPlugin(output_path=output_path))
 
     # Генерации финального аналитического графика.
     plugins.append(TimelineChartPlugin(output_path=output_path))

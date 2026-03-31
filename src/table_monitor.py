@@ -1,91 +1,115 @@
 """
-Бизнес-логика мониторинга состояния столика.
+Бизнес-логика мониторинга состояния столика (Production Grade)
+============================================================
 
-Архитектура: Паттерн «Машина состояний» (State Machine / FSM).
-Каждое состояние — отдельный класс, инкапсулирующий:
-  - бизнес-правило: «когда переходить в другое состояние»
-  - аналитику: «что записать при входе в это состояние»
+Архитектура: Конечный автомат (FSM) / Паттерн «Состояние»
+--------------------------------------------------------
+Этот модуль реализует надежную систему мониторинга занятости столиков, предназначенную
+для высоконагруженной видеоаналитики. Используется паттерн «Состояние» для инкапсуляции
+бизнес-правил, что гарантирует предсказуемость переходов, логики дебаунса (защиты от дребезга)
+и генерации аналитики.
 
-Достаточно посмотреть на класс состояния — и сразу понятно его поведение.
+Блок-схема работы (Граф состояний):
+-----------------------------------
+      [ СТАРТ ]
+          |
+          v
+    +-----------+       человек обнаружен (> N кадров)       +--------------+
+    |   EMPTY   | ------------------------------------------>|   APPROACH   |
+    | (Свободно)| <----------------------------------------- |   (Подход)   |
+    +-----------+       человек ушел (> K кадров)            +--------------+
+          ^                                                         |
+          |                                                         | задержка (> M кадров)
+          |             человек ушел (> K кадров)                   v
+          |                                                  +--------------+
+          +--------------------------------------------------|   OCCUPIED   |
+                                                             |   (Занято)   |
+                                                             +--------------+
 
-Граф переходов:
-                   человек появился (>= min_occupied_frames)
-    ┌──────────────────────────────────────────────────────────────┐
-    │                                                              ▼
-  EMPTY                                                        APPROACH
-    ▲                              задержался (>= min_stay_frames) │
-    │  прошёл мимо (>= min_empty_frames) ◄─────────────────────────┘
-    │
-    │         ушёл (>= min_empty_frames)
-  EMPTY  ◄──────────────────────────────────────────────────  OCCUPIED
-    ▲                                                              │
-    └──────────────────────────────────────────────────────────────┘
+Основные архитектурные концепции:
+1. Интервальный трекинг: В отличие от простых логгеров событий, система отслеживает
+   непрерывные «Интервалы состояний», что позволяет проводить точный анализ длительности
+   (например, «как долго стол был занят», а не просто «когда он стал занятым»).
+2. Изоляция контекста: Все изменяемые данные хранятся в `_MonitorContext`.
+   Классы состояний предоставляют только логику, что облегчает тестирование и масштабируемость.
+3. Дебаунс и гистерезис: Счетчики предотвращают «мерцание» (частую смену состояний),
+   вызванное шумом детектора или кратковременными перекрытиями объекта.
+4. Обратная совместимость: Поддерживает устаревшие структуры `CleanupRecord` и `StateTransition`
+   для обеспечения работы существующих тестов и плагинов отчетности.
 
-Соответствие ТЗ:
-  ✅ Три состояния: EMPTY, OCCUPIED, APPROACH
-  ✅ Дебаунс (защита от мерцания детектора)
-  ✅ Временные метки в Pandas DataFrame
-  ✅ Аналитика: среднее время между уходом гостя и подходом следующего
+Технические требования:
+    - Python 3.9+
+    - Pandas (для экспорта в DataFrame)
 """
 
 from __future__ import annotations
-
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Optional
+from typing import Optional, List
 import pandas as pd
 import logging
 
+# Настройка логгера модуля
 logger = logging.getLogger(__name__)
 
-
 # ---------------------------------------------------------------------------
-# Типы данных (Value Objects)
+# Типы данных (Value Objects и DTO)
 # ---------------------------------------------------------------------------
 
 class TableState(Enum):
     """
-    Состояния столика.
-
-    EMPTY    — в зоне ROI никого нет, стол свободен.
-    APPROACH — кто-то появился после периода пустоты; ждём подтверждения:
-               задержался → OCCUPIED, ушёл сразу → EMPTY (прошёл мимо).
-    OCCUPIED — человек подтверждённо находится за столом.
+    Доступные состояния зоны столика.
+    EMPTY: Человек не обнаружен.
+    APPROACH: Транзитное состояние; человек появился, но еще не задержался надолго.
+    OCCUPIED: Подтвержденная занятость.
     """
     EMPTY    = auto()
     APPROACH = auto()
     OCCUPIED = auto()
 
+@dataclass
+class StateInterval:
+    """Представляет непрерывный период времени, проведенный в определенном состоянии."""
+    state: TableState
+    frame_start: int
+    frame_end: int
+    start_sec: float
+    end_sec: float
+
+    @property
+    def duration(self) -> float:
+        """Вычисляет длительность в секундах."""
+        return self.end_sec - self.start_sec
 
 @dataclass(frozen=True)
 class StateTransition:
-    """Иммутабельный факт смены состояния."""
+    """
+    Неизменяемая запись о событии смены состояния.
+    Сохранена для обратной совместимости с инструментами отчетности.
+    """
     frame_no:   int
-    timestamp:  float        # секунды от начала видео
+    timestamp:  float
     prev_state: TableState
     next_state: TableState
 
     @property
     def event_name(self) -> str:
+        """Человекочитаемое название перехода."""
         return f"{self.prev_state.name} → {self.next_state.name}"
-
 
 @dataclass(frozen=True)
 class ProgressSnapshot:
-    """Процент заполнения порогов (0.0 - 1.0)."""
+    """Отображает текущий прогресс заполнения счетчиков дебаунса (от 0.0 до 1.0)."""
     to_approach: float
     to_occupied: float
     to_empty:    float
 
-
 @dataclass
 class CleanupRecord:
     """
-    Одна запись о цикле «стол освободился → подтверждённый гость пришёл».
-
-    approach_at_* заполняется только когда APPROACH подтвердился в OCCUPIED.
-    Если человек прошёл мимо (APPROACH → EMPTY), цикл остаётся открытым.
+    Устаревшая метрика: Измеряет «Время реакции» между моментом освобождения
+    стола и приходом следующего гостя.
     """
     empty_at_frame:    int
     empty_at_sec:      float
@@ -94,443 +118,262 @@ class CleanupRecord:
 
     @property
     def response_time_sec(self) -> Optional[float]:
-        """Время реакции: сколько секунд стол ждал между гостями."""
-        if self.approach_at_sec is None:
-            return None
+        """Вычисляет время реакции в секундах, если цикл завершен."""
+        if self.approach_at_sec is None: return None
         return self.approach_at_sec - self.empty_at_sec
 
-
 # ---------------------------------------------------------------------------
-# Контекст — хранилище данных, доступных всем состояниям
+# Контекст FSM (Контейнер данных)
 # ---------------------------------------------------------------------------
 
 @dataclass
 class _MonitorContext:
     """
-    Разделяемый контекст FSM.
-
-    Состояния читают и пишут сюда — единственный канал обмена данными.
-    Сам класс не содержит никакой логики, только данные.
+    Внутренний контейнер общего состояния.
+    Отделяет логику состояний от хранения данных.
     """
-    min_empty_frames:    int   # кадров пустоты для перехода в EMPTY
-    min_occupied_frames: int   # кадров присутствия для входа в APPROACH
-    min_stay_frames:     int   # кадров в APPROACH для подтверждения OCCUPIED
+    min_empty_frames:    int  # Кадров для подтверждения EMPTY
+    min_occupied_frames: int  # Кадров для входа в APPROACH
+    min_stay_frames:     int  # Кадров для подтверждения OCCUPIED
 
     consecutive_empty:    int = 0
     consecutive_occupied: int = 0
 
+    # Современное хранилище на основе интервалов
+    intervals: list[StateInterval] = field(default_factory=list)
+    active_interval: Optional[StateInterval] = None
+
+    # Устаревшее хранилище на основе событий
     transitions:   list[StateTransition] = field(default_factory=list)
     open_cycles:   list[CleanupRecord]   = field(default_factory=list)
     closed_cycles: list[CleanupRecord]   = field(default_factory=list)
 
-
 # ---------------------------------------------------------------------------
-# Базовый класс состояния (принцип Open/Closed из SOLID)
+# Интерфейс состояния и реализации
 # ---------------------------------------------------------------------------
 
 class _BaseTableState(ABC):
-    """
-    Абстрактный класс состояния столика.
-
-    Каждый наследник отвечает ровно за одно состояние и реализует:
-      tag        — идентификатор состояния (значение TableState)
-      on_enter() — побочные эффекты при входе в состояние (аналитика)
-      handle()   — бизнес-правило: в какое состояние перейти на этом кадре?
-
-    Принцип Single Responsibility: один класс = одно состояние = одно правило.
-    """
-
+    """Абстрактный базовый класс для всех состояний FSM."""
     @property
     @abstractmethod
-    def tag(self) -> TableState:
-        """Идентификатор этого состояния."""
-
+    def tag(self) -> TableState: ...
+    
+    def on_enter(self, ctx: _MonitorContext, frame_no: int, timestamp: float) -> None: 
+        """Хуки для логики, выполняемой при входе в состояние (например, аналитика)."""
+        pass
+        
     @abstractmethod
-    def on_enter(self, ctx: _MonitorContext, frame_no: int, timestamp: float) -> None:
-        """Вызывается один раз при входе. Здесь — аналитика и побочные эффекты."""
-
-    @abstractmethod
-    def handle(
-        self,
-        ctx: _MonitorContext,
-        frame_no: int,
-        timestamp: float,
-        occupied: bool,
-    ) -> Optional["_BaseTableState"]:
-        """
-        Проверить условие перехода на текущем кадре.
-
-        Returns:
-            Следующее состояние — если пора переходить.
-            None              — если остаёмся в текущем.
-        """
-
-
-# ---------------------------------------------------------------------------
-# Конкретные состояния — здесь живут ВСЕ бизнес-правила системы
-# ---------------------------------------------------------------------------
+    def handle(self, ctx: _MonitorContext, frame_no: int, timestamp: float, occupied: bool) -> Optional["_BaseTableState"]: 
+        """Оценивает логику переходов для каждого кадра."""
+        ...
 
 class _EmptyState(_BaseTableState):
-    """
-    Состояние: СТОЛ ПУСТОЙ.
-
-    Бизнес-правило перехода:
-      Если человек появляется в зоне ROI и удерживается не менее
-      min_occupied_frames кадров подряд → переходим в APPROACH.
-
-    Аналитика при входе:
-      Открываем новый цикл ожидания — фиксируем момент, когда стол стал пустым.
-      (ТЗ: «Для каждого случая, когда стол стал пустым, определи,
-             через какое время к нему подошёл следующий человек»)
-    """
-
+    """Логика состояния EMPTY: стол свободен."""
     @property
-    def tag(self) -> TableState:
-        return TableState.EMPTY
-
+    def tag(self) -> TableState: return TableState.EMPTY
+    
     def on_enter(self, ctx: _MonitorContext, frame_no: int, timestamp: float) -> None:
-        # Если это самый старт (нет переходов) ИЛИ мы пришли из OCCUPIED
-        is_startup = not ctx.transitions
-        came_from_occupied = ctx.transitions and ctx.transitions[-1].prev_state == TableState.OCCUPIED
-
-        if is_startup or came_from_occupied:
-            # Проверяем, нет ли уже открытого цикла (на всякий случай)
-            if not ctx.open_cycles:
-                ctx.open_cycles.append(CleanupRecord(
-                    empty_at_frame=frame_no,
-                    empty_at_sec=timestamp,
-                ))
-
-    def handle(
-        self,
-        ctx: _MonitorContext,
-        frame_no: int,
-        timestamp: float,
-        occupied: bool,
-    ) -> Optional[_BaseTableState]:
+        if not ctx.open_cycles:
+            ctx.open_cycles.append(CleanupRecord(empty_at_frame=frame_no, empty_at_sec=timestamp))
+            
+    def handle(self, ctx: _MonitorContext, frame_no: int, timestamp: float, occupied: bool) -> Optional[_BaseTableState]:
         if occupied and ctx.consecutive_occupied >= ctx.min_occupied_frames:
-            # ТЗ: «Подход к столу (появление человека в зоне после периода пустоты)»
             return _ApproachState()
         return None
 
-
 class _ApproachState(_BaseTableState):
-    """
-    Состояние: ПОДХОД К СТОЛУ (период наблюдения).
-
-    Человек появился — но мы ещё не знаем, сел ли он или проходит мимо.
-    Остаёмся в этом состоянии, пока не накопится достаточно кадров в ту
-    или иную сторону.
-
-    Бизнес-правило перехода:
-      Человек задержался (>= min_stay_frames кадров присутствия подряд)
-        → OCCUPIED: гость подтверждён, закрываем цикл ожидания.
-      Человек исчез (>= min_empty_frames кадров отсутствия подряд)
-        → EMPTY: прошёл мимо, цикл ожидания остаётся открытым.
-
-    Аналитика при входе:
-      Намеренно ничего не делаем — цикл закроет _OccupiedState,
-      только когда присутствие подтверждено. «Прохожий» в статистику
-      времени отклика не попадёт.
-    """
-
+    """Логика состояния APPROACH: человек обнаружен, ожидаем подтверждения пребывания."""
     @property
-    def tag(self) -> TableState:
-        return TableState.APPROACH
-
-    def on_enter(self, ctx: _MonitorContext, frame_no: int, timestamp: float) -> None:
-        pass  # ждём подтверждения; аналитику пишет _OccupiedState при входе
-
-    def handle(
-        self,
-        ctx: _MonitorContext,
-        frame_no: int,
-        timestamp: float,
-        occupied: bool,
-    ) -> Optional[_BaseTableState]:
+    def tag(self) -> TableState: return TableState.APPROACH
+    
+    def handle(self, ctx: _MonitorContext, frame_no: int, timestamp: float, occupied: bool) -> Optional[_BaseTableState]:
         if occupied and ctx.consecutive_occupied >= ctx.min_stay_frames:
-            # Человек задержался достаточно долго → это гость, не прохожий
             return _OccupiedState()
-
         if not occupied and ctx.consecutive_empty >= ctx.min_empty_frames:
-            # Человек ушёл быстро → прошёл мимо, стол снова пустой
-            return _EmptyState()
-
-        return None  # ещё не ясно — наблюдаем дальше
-
-
-class _OccupiedState(_BaseTableState):
-    """
-    Состояние: СТОЛ ЗАНЯТ.
-
-    Бизнес-правило перехода:
-      Если зона ROI пустует не менее min_empty_frames кадров подряд → EMPTY.
-
-    Аналитика при входе:
-      Закрываем открытый цикл ожидания — фиксируем подтверждённый момент
-      появления гостя. Делаем это здесь, а не при входе в APPROACH, чтобы
-      «прохожий» не учитывался в статистике времени отклика.
-      (ТЗ: «Среднее время между уходом гостя и подходом следующего человека»)
-    """
-
-    @property
-    def tag(self) -> TableState:
-        return TableState.OCCUPIED
-
-    def on_enter(self, ctx: _MonitorContext, frame_no: int, timestamp: float) -> None:
-        # Цикл закрываем только сейчас — присутствие гостя подтверждено.
-        if ctx.open_cycles:
-            cycle = ctx.open_cycles.pop()
-            cycle.approach_at_frame = frame_no
-            cycle.approach_at_sec   = timestamp
-            ctx.closed_cycles.append(cycle)
-
-    def handle(
-        self,
-        ctx: _MonitorContext,
-        frame_no: int,
-        timestamp: float,
-        occupied: bool,
-    ) -> Optional[_BaseTableState]:
-        if not occupied and ctx.consecutive_empty >= ctx.min_empty_frames:
-            # ТЗ: «Стол пустой (людей в зоне нет)»
             return _EmptyState()
         return None
 
+class _OccupiedState(_BaseTableState):
+    """Логика состояния OCCUPIED: занятость подтверждена."""
+    @property
+    def tag(self) -> TableState: return TableState.OCCUPIED
+    
+    def on_enter(self, ctx: _MonitorContext, frame_no: int, timestamp: float) -> None:
+        if ctx.open_cycles:
+            cycle = ctx.open_cycles.pop()
+            cycle.approach_at_frame = frame_no
+            cycle.approach_at_sec = timestamp
+            ctx.closed_cycles.append(cycle)
+            
+    def handle(self, ctx: _MonitorContext, frame_no: int, timestamp: float, occupied: bool) -> Optional[_BaseTableState]:
+        if not occupied and ctx.consecutive_empty >= ctx.min_empty_frames:
+            return _EmptyState()
+        return None
 
 # ---------------------------------------------------------------------------
-# TableMonitor — оркестратор FSM
+# TableMonitor (Публичный оркестратор)
 # ---------------------------------------------------------------------------
 
 class TableMonitor:
     """
-    Конечный автомат (FSM) для отслеживания состояния одного столика.
-
-    Принцип работы:
-        Вызывай update() на каждом кадре, передавая:
-          - frame_no : порядковый номер кадра (0-based)
-          - fps      : частота кадров видео (для перевода в секунды)
-          - occupied : True если детектор обнаружил человека в зоне ROI
-
-        Класс сам управляет дебаунсом, историей переходов и аналитикой.
-
-    Параметры (все в кадрах):
-        min_empty_frames    : сколько кадров пустоты нужно для перехода в EMPTY.
-                              Защищает от мерцания детектора.
-                              По умолчанию 30 (~1 сек при 30fps).
-
-        min_occupied_frames : сколько кадров присутствия нужно для входа в APPROACH.
-                              По умолчанию 5 (~0.17 сек при 30fps).
-
-        min_stay_frames     : сколько кадров нужно пробыть в APPROACH,
-                              чтобы перейти в OCCUPIED («гость», а не «прохожий»).
-                              Бизнес-смысл: если официант лишь убрал тарелку и ушёл,
-                              это не считается «занятием» стола.
-                              По умолчанию 15 (~0.5 сек при 30fps).
+    Основная точка входа для мониторинга столика.
+    Управляет жизненным циклом FSM и предоставляет методы экспорта данных.
     """
-
-    def __init__(
-        self,
-        min_empty_frames:    int = 200,
-        min_occupied_frames: int = 15,
-        min_stay_frames:     int = 150,
-    ):
+    def __init__(self, min_empty_frames=200, min_occupied_frames=15, min_stay_frames=150):
         self._ctx = _MonitorContext(
             min_empty_frames=min_empty_frames,
             min_occupied_frames=min_occupied_frames,
             min_stay_frames=min_stay_frames,
         )
-        # Начальное состояние — стол пустой.
-        # on_enter не вызываем: нет предыдущего гостя, цикл ожидания не нужен.
         self._current: _BaseTableState = _EmptyState()
 
     def set_initial_state(self, occupied: bool, frame_no: int, fps: float):
-        """
-        Устанавливает состояние на самом первом кадре видео.
-        """
+        """Принудительно устанавливает начальное состояние на основе первого кадра."""
         timestamp = frame_no / fps
         if occupied:
-            # Если сразу видим человека, ставим OCCUPIED
             self._current = _OccupiedState()
-            # Важно: МЫ НЕ ОТКРЫВАЕМ ЦИКЛ, так как стол еще не освобождался
-            logger.info("Старт системы: стол ЗАНЯТ")
+            logger.info("Старт: стол ЗАНЯТ")
         else:
-            # Если стол пуст, вызываем on_enter у EmptyState
             self._current = _EmptyState()
             self._current.on_enter(self._ctx, frame_no, timestamp)
-            logger.info("Старт системы: стол СВОБОДЕН")
+            logger.info("Старт: стол СВОБОДЕН")
+        self._init_interval(self._current.tag, frame_no, timestamp)
 
-    # -----------------------------------------------------------------------
-    # Публичный API
-    # -----------------------------------------------------------------------
-
-    @property
-    def state(self) -> TableState:
-        """Текущее подтверждённое состояние столика."""
-        return self._current.tag
-
-    @property
-    def transitions(self) -> list[StateTransition]:
-        """Копия списка всех зафиксированных переходов состояний."""
-        return list(self._ctx.transitions)
+    def _init_interval(self, state: TableState, frame: int, ts: float):
+        """Инициализирует новый интервал отслеживания."""
+        self._ctx.active_interval = StateInterval(
+            state=state, frame_start=frame, frame_end=frame,
+            start_sec=ts, end_sec=ts
+        )
 
     def update(self, frame_no: int, fps: float, occupied: bool) -> Optional[StateTransition]:
-        """
-        Обработать один кадр.
-
-        Args:
-            frame_no : порядковый номер кадра (0-based)
-            fps      : частота кадров видео
-            occupied : True если в зоне ROI обнаружен человек
-
-        Returns:
-            StateTransition если состояние изменилось на этом кадре, иначе None.
-        """
+        """Обрабатывает один кадр; возвращает объект перехода, если состояние изменилось."""
         timestamp = frame_no / fps
         self._update_debounce_counters(occupied)
 
+        # Продлеваем длительность текущего интервала
+        if self._ctx.active_interval:
+            self._ctx.active_interval.frame_end = frame_no
+            self._ctx.active_interval.end_sec = timestamp
+
         next_state = self._current.handle(self._ctx, frame_no, timestamp, occupied)
-        if next_state is None:
-            return None
+        if next_state:
+            return self._do_transition(next_state, frame_no, timestamp)
+        return None
 
-        return self._do_transition(next_state, frame_no, timestamp)
-
-    def get_analytics(self) -> dict:
-        """
-        Итоговая аналитика по всем завершённым циклам.
-
-        Завершённый цикл: стол стал пустым → появился подтверждённый гость.
-        Незавершённый: видео кончилось пока стол пустой или в состоянии APPROACH.
-
-        Ключевая метрика (ТЗ): среднее время между уходом гостя и подходом следующего.
-        """
-        times = [
-            c.response_time_sec
-            for c in self._ctx.closed_cycles
-            if c.response_time_sec is not None
-        ]
-
-        if not times:
-            return {
-                "total_cycles":        0,
-                "completed_cycles":    0,
-                "open_cycles":         len(self._ctx.open_cycles),
-                "mean_response_sec":   None,
-                "median_response_sec": None,
-                "min_response_sec":    None,
-                "max_response_sec":    None,
-            }
-
-        return {
-            "total_cycles":        len(self._ctx.closed_cycles) + len(self._ctx.open_cycles),
-            "completed_cycles":    len(self._ctx.closed_cycles),
-            "open_cycles":         len(self._ctx.open_cycles),
-            "mean_response_sec":   round(sum(times) / len(times), 2),
-            "median_response_sec": round(sorted(times)[len(times) // 2], 2),
-            "min_response_sec":    round(min(times), 2),
-            "max_response_sec":    round(max(times), 2),
-        }
-
-    def get_events_dataframe(self) -> pd.DataFrame:
-        """
-        Все события в виде Pandas DataFrame.
-        Колонки: frame_no, timestamp_sec, prev_state, next_state, event_name.
-        """
-        if not self._ctx.transitions:
-            return pd.DataFrame(columns=[
-                "frame_no", "timestamp_sec", "prev_state", "next_state", "event_name"
-            ])
-        return pd.DataFrame([
-            {
-                "frame_no":      t.frame_no,
-                "timestamp_sec": round(t.timestamp, 3),
-                "prev_state":    t.prev_state.name,
-                "next_state":    t.next_state.name,
-                "event_name":    t.event_name,
-            }
-            for t in self._ctx.transitions
-        ])
-
-    def get_cycles_dataframe(self) -> pd.DataFrame:
-        """
-        Все циклы «стол освободился → подтверждённый гость» в виде DataFrame.
-        Колонки: empty_at_sec, approach_at_sec, response_time_sec, is_completed.
-        """
-        all_cycles = self._ctx.closed_cycles + self._ctx.open_cycles
-        if not all_cycles:
-            return pd.DataFrame(columns=[
-                "empty_at_frame", "empty_at_sec",
-                "approach_at_frame", "approach_at_sec",
-                "response_time_sec", "is_completed",
-            ])
-        return pd.DataFrame([
-            {
-                "empty_at_frame":    c.empty_at_frame,
-                "empty_at_sec":      round(c.empty_at_sec, 3),
-                "approach_at_frame": c.approach_at_frame,
-                "approach_at_sec":   round(c.approach_at_sec, 3) if c.approach_at_sec else None,
-                "response_time_sec": round(c.response_time_sec, 2) if c.response_time_sec else None,
-                "is_completed":      c in self._ctx.closed_cycles,
-            }
-            for c in all_cycles
-        ])
-    
-    def get_progress(self) -> ProgressSnapshot:
-        """Возвращает текущую заполненность счетчиков дебаунса."""
-        ctx = self._ctx
+    def _do_transition(self, next_state: _BaseTableState, frame_no: int, timestamp: float) -> StateTransition:
+        """Выполняет логику перехода и архивацию данных."""
+        prev_tag = self._current.tag
         
-        # Считаем прогресс, избегая деления на ноль
-        def calc(val, threshold):
-            return min(val / threshold, 1.0) if threshold > 0 else 0.0
-
-        return ProgressSnapshot(
-            to_approach = calc(ctx.consecutive_occupied, ctx.min_occupied_frames),
-            to_occupied = calc(ctx.consecutive_occupied, ctx.min_stay_frames),
-            to_empty    = calc(ctx.consecutive_empty, ctx.min_empty_frames)
-        )
-
-    # -----------------------------------------------------------------------
-    # Внутренняя механика FSM
-    # -----------------------------------------------------------------------
-
-    def _update_debounce_counters(self, occupied: bool) -> None:
-        """
-        Обновить счётчики непрерывного присутствия/отсутствия.
-        При смене направления противоположный счётчик сбрасывается в ноль.
-        """
-        if occupied:
-            self._ctx.consecutive_occupied += 1
-            self._ctx.consecutive_empty    = 0
-        else:
-            self._ctx.consecutive_empty    += 1
-            self._ctx.consecutive_occupied = 0
-
-    def _do_transition(
-        self,
-        next_state: _BaseTableState,
-        frame_no: int,
-        timestamp: float,
-    ) -> StateTransition:
-        """
-        Выполнить переход в новое состояние:
-          1. Записать переход в историю.
-          2. Вызвать on_enter() нового состояния (аналитика).
-          3. Установить новое состояние как текущее.
-          4. Сбросить счётчики дебаунса — новое состояние начинает считать с нуля.
-        """
+        if self._ctx.active_interval:
+            self._ctx.intervals.append(self._ctx.active_interval)
+        
+        self._init_interval(next_state.tag, frame_no, timestamp)
+        
         transition = StateTransition(
-            frame_no=frame_no,
-            timestamp=timestamp,
-            prev_state=self._current.tag,
-            next_state=next_state.tag,
+            frame_no=frame_no, timestamp=timestamp,
+            prev_state=prev_tag, next_state=next_state.tag
         )
         self._ctx.transitions.append(transition)
-        next_state.on_enter(self._ctx, frame_no, timestamp)
+        
         self._current = next_state
-
-        # Сбрасываем счётчики: новое состояние должно накопить свои кадры заново.
-        # Это гарантирует, что из APPROACH нельзя выйти мгновенно.
-        self._ctx.consecutive_empty    = 0
+        self._current.on_enter(self._ctx, frame_no, timestamp)
+        
+        self._ctx.consecutive_empty = 0
         self._ctx.consecutive_occupied = 0
-
         return transition
+
+    # --- API аналитики и экспорта данных ---
+
+    def get_intervals_dataframe(self) -> pd.DataFrame:
+        """Экспортирует полную временную шкалу интервалов состояний в виде DataFrame."""
+        data = self._ctx.intervals.copy()
+        if self._ctx.active_interval:
+            data.append(self._ctx.active_interval)
+            
+        return pd.DataFrame([{
+            "state": i.state.name,
+            "start_sec": round(i.start_sec, 2),
+            "end_sec": round(i.end_sec, 2),
+            "duration": round(i.duration, 2),
+            "frame_start": i.frame_start,
+            "frame_end": i.frame_end
+        } for i in data])
+
+    def get_analytics(self) -> dict:
+        """Вычисляет ключевые показатели эффективности (KPI) времени реакции столика."""
+        times = [c.response_time_sec for c in self._ctx.closed_cycles if c.response_time_sec is not None]
+        
+        res = {
+            "total_cycles": len(self._ctx.closed_cycles) + len(self._ctx.open_cycles),
+            "completed_cycles": len(self._ctx.closed_cycles),
+            "open_cycles": len(self._ctx.open_cycles),
+            "mean_response_sec": None,
+            "median_response_sec": None,
+            "min_response_sec": None,
+            "max_response_sec": None,
+        }
+        
+        if times:
+            res.update({
+                "mean_response_sec": round(sum(times) / len(times), 2),
+                "median_response_sec": round(sorted(times)[len(times) // 2], 2),
+                "min_response_sec": round(min(times), 2),
+                "max_response_sec": round(max(times), 2),
+            })
+        return res
+
+    def get_cycles_dataframe(self) -> pd.DataFrame:
+        """Экспортирует данные об устаревших циклах уборки для отчетов."""
+        all_cycles = self._ctx.closed_cycles + self._ctx.open_cycles
+        if not all_cycles:
+            return pd.DataFrame(columns=["empty_at_frame", "empty_at_sec", "approach_at_frame", 
+                                         "approach_at_sec", "response_time_sec", "is_completed"])
+        return pd.DataFrame([{
+            "empty_at_frame": c.empty_at_frame,
+            "empty_at_sec": round(c.empty_at_sec, 3),
+            "approach_at_frame": c.approach_at_frame,
+            "approach_at_sec": round(c.approach_at_sec, 3) if c.approach_at_sec else None,
+            "response_time_sec": round(c.response_time_sec, 2) if c.response_time_sec else None,
+            "is_completed": c in self._ctx.closed_cycles,
+        } for c in all_cycles])
+
+    def get_events_dataframe(self) -> pd.DataFrame:
+        """Экспортирует моментальные события переходов состояний."""
+        if not self._ctx.transitions:
+            return pd.DataFrame(columns=["frame_no", "timestamp_sec", "prev_state", "next_state", "event_name"])
+        return pd.DataFrame([{
+            "frame_no": t.frame_no,
+            "timestamp_sec": round(t.timestamp, 3),
+            "prev_state": t.prev_state.name,
+            "next_state": t.next_state.name,
+            "event_name": t.event_name,
+        } for t in self._ctx.transitions])
+
+    def get_progress(self) -> ProgressSnapshot:
+        """Вычисляет текущий процент удовлетворения пороговых значений дебаунса."""
+        def calc(val, thr): return min(val / thr, 1.0) if thr > 0 else 0.0
+        return ProgressSnapshot(
+            to_approach=calc(self._ctx.consecutive_occupied, self._ctx.min_occupied_frames),
+            to_occupied=calc(self._ctx.consecutive_occupied, self._ctx.min_stay_frames),
+            to_empty=calc(self._ctx.consecutive_empty, self._ctx.min_empty_frames)
+        )
+
+    @property
+    def state(self) -> TableState: 
+        """Текущее состояние FSM."""
+        return self._current.tag
+
+    @property
+    def transitions(self) -> list[StateTransition]: 
+        """История всех переходов."""
+        return list(self._ctx.transitions)
+
+    def _update_debounce_counters(self, occupied: bool) -> None:
+        """Внутренняя логика обновления счетчиков, используемых для гистерезиса."""
+        if occupied:
+            self._ctx.consecutive_occupied += 1
+            self._ctx.consecutive_empty = 0
+        else:
+            self._ctx.consecutive_empty += 1
+            self._ctx.consecutive_occupied = 0

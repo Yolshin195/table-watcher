@@ -524,7 +524,7 @@ class TimelineChartPlugin(BasePlugin):
     Рисует непрерывную ступенчатую линию с цветовой заливкой от t=0 до конца видео.
     """
 
-    def __init__(self, output_path: Optional[Path], filename: str = "timeline.png"):
+    def __init__(self, output_path: Optional[Path | str], filename: str = "timeline.png"):
         self.output_dir = Path(output_path or ".")
         self.filename = filename
         self._total_frames: int = 0
@@ -803,3 +803,231 @@ class UnifiedHistoryLogger(BasePlugin):
         if a['mean_response_sec']:
             print(f"📊 СРЕДНЕЕ ВРЕМЯ МЕЖДУ ГОСТЯМИ (ТЗ): {a['mean_response_sec']} сек")
         print("="*95 + "\n")
+
+
+class BusinessAnalyticsPlugin(BasePlugin):
+    """
+    Финальный плагин отчета, полностью соответствующий ТЗ.
+    Считает:
+    1. Среднее время простоя (EMPTY -> APPROACH) — требование ТЗ.
+    2. Среднее время обслуживания (длительность OCCUPIED).
+    3. Статистику всех подходов (включая тех, кто не сел).
+    """
+    def __init__(
+        self,
+        output_path: Optional[Path | str],
+        filename: str = "business_report.txt",
+        video_path: str = ""
+    ):
+        self.output_path = Path(output_path or ".") / filename
+        self.video_path = video_path
+        self._roi = None
+
+    def on_start(self, total_frames: int, fps: float, roi: tuple) -> None:
+        self._roi = roi
+        self._fps = fps
+    
+    def on_frame(self, ctx: FrameContext) -> None:
+        """
+        Реализация абстрактного метода. 
+        Нам не нужно обрабатывать каждый кадр, поэтому просто пропускаем.
+        """
+        pass
+
+    def on_finish(self, monitor: TableMonitor) -> None:
+        # Получаем данные из монитора
+        df_events = monitor.get_events_dataframe()
+        df_cycles = monitor.get_cycles_dataframe() # Здесь наши исправленные циклы
+
+        if df_events.empty:
+            logger.warning("Нет событий для формирования отчета.")
+            return
+
+        # --- 1. Расчет метрики ТЗ: EMPTY -> APPROACH ---
+        # Берем все случаи, где зафиксирован подход (даже если цикл не завершен)
+        wait_times = df_cycles['response_time_sec'].dropna().tolist()
+        avg_wait = sum(wait_times) / len(wait_times) if wait_times else 0
+
+        # --- 2. Расчет времени "Стол занят" (OCCUPIED) ---
+        # Считаем разницу между входом в OCCUPIED и выходом из него
+        occupied_durations = []
+        occ_start = None
+        for _, row in df_events.iterrows():
+            if row['next_state'] == 'OCCUPIED':
+                occ_start = row['timestamp_sec']
+            elif row['prev_state'] == 'OCCUPIED' and occ_start is not None:
+                occupied_durations.append(row['timestamp_sec'] - occ_start)
+                occ_start = None
+        
+        avg_occupied = sum(occupied_durations) / len(occupied_durations) if occupied_durations else 0
+
+        # --- 3. Статистика прохожих (EMPTY -> APPROACH -> EMPTY) ---
+        # Это циклы, которые остались в статусе is_completed = False, но имеют approach_at
+        false_approaches = df_cycles[(df_cycles['is_completed'] == False) & (df_cycles['approach_at_sec'].notna())]
+
+        # Формируем текст отчета
+        lines = [
+            "======================================================",
+            "        ИТОГОВЫЙ БИЗНЕС-ОТЧЕТ (ПО ТРЕБОВАНИЯМ ТЗ)",
+            "======================================================",
+            f"Видео файл:      {self.video_path}",
+            f"Зона стола (ROI): x={self._roi[0]}, y={self._roi[1]}, w={self._roi[2]}, h={self._roi[3]}",
+            "------------------------------------------------------",
+            "1. ОСНОВНАЯ МЕТРИКА ТЗ",
+            f"Среднее время между уходом гостя и подходом: {avg_wait:.2f} сек",
+            f"Всего зафиксировано подходов к столу:        {len(wait_times)}",
+            "",
+            "2. АНАЛИТИКА ЗАЯТОСТИ",
+            f"Среднее время, пока стол был ЗАНЯТ:          {avg_occupied:.2f} сек",
+            f"Количество подтвержденных посадок:           {len(occupied_durations)}",
+            "",
+            "3. СТАТИСТИКА ПОДХОДОВ (Прохожие/Официанты)",
+            f"Случаи 'Approach -> Empty' (не сели):        {len(false_approaches)}",
+            "------------------------------------------------------",
+            "ПОДРОБНЫЙ ЛОГ ЦИКЛОВ:",
+            "Освободился | Подошли     | Задержка | Статус"
+        ]
+
+        for _, row in df_cycles.iterrows():
+            empty_ts = self._fmt_ts(row['empty_at_sec'])
+            appr_ts  = self._fmt_ts(row['approach_at_sec'])
+            delay    = f"{row['response_time_sec']:>6.1f}s" if row['response_time_sec'] else "      --"
+            status   = "ПОСАДКА" if row['is_completed'] else "ПРОХОЖИЙ"
+            lines.append(f"{empty_ts}    | {appr_ts}    | {delay} | {status}")
+
+        lines.append("======================================================")
+
+        # Сохранение
+        self.output_path.write_text("\n".join(lines), encoding="utf-8")
+        print(f"\n✅ Текстовый отчет по ТЗ сохранен в: {self.output_path}")
+
+    @staticmethod
+    def _fmt_ts(sec):
+        if sec is None or pd.isna(sec): return "--:--:--"
+        m, s = divmod(sec, 60)
+        return f"{int(m):02d}:{s:05.2f}"
+
+
+class IntervalAnalyticsPlugin(BasePlugin):
+    """
+    Плагин нового поколения. 
+    Анализирует интервалы (Interval-based) вместо событийных хуков.
+    """
+    def __init__(
+        self,
+        output_path: Optional[Path | str],
+        filename: str = "interval_report.txt",
+    ):
+        self.output_path = Path(output_path or ".") / filename
+    
+    def on_frame(self, ctx: FrameContext) -> None:
+        """
+        Реализация абстрактного метода. 
+        Нам не нужно обрабатывать каждый кадр, поэтому просто пропускаем.
+        """
+        pass
+
+    def on_process_finished(self, monitor: 'TableMonitor'):
+        # 1. Получаем все интервалы (включая текущий активный)
+        df = monitor.get_intervals_dataframe()
+        if df.empty:
+            logger.warning("Нет данных для анализа интервалов.")
+            return
+
+        # 2. Логика поиска "Времени реакции":
+        # Нам нужно найти пары: [EMPTY] -> [APPROACH или OCCUPIED]
+        service_delays = []
+        
+        # Итерируемся по списку интервалов
+        for i in range(len(df) - 1):
+            current = df.iloc[i]
+            next_int = df.iloc[i+1]
+            
+            # Если стол освободился (стал EMPTY)
+            if current['state'] == "EMPTY":
+                # Время "реакции" — это когда кто-то подошел (APPROACH)
+                # или сразу сел (OCCUPIED), если APPROACH был пропущен
+                if next_int['state'] in ["APPROACH", "OCCUPIED"]:
+                    delay = next_int['start_sec'] - current['start_sec']
+                    service_delays.append({
+                        "freed_at": current['start_sec'],
+                        "staff_arrived_at": next_int['start_sec'],
+                        "delay": delay
+                    })
+
+        # 3. Формируем отчет
+        self._save_report(df, service_delays)
+
+    def _save_report(self, df_intervals: pd.DataFrame, delays: list):
+        lines = [
+            "======================================================",
+            "   ОТЧЕТ НА ОСНОВЕ ИНТЕРВАЛЬНОЙ ЛОГИКИ (80/20)",
+            "======================================================",
+            f"Всего зафиксировано интервалов: {len(df_intervals)}",
+            ""
+        ]
+
+        if delays:
+            avg_delay = sum(d['delay'] for d in delays) / len(delays)
+            lines.extend([
+                "1. МЕТРИКА ОБСЛУЖИВАНИЯ",
+                f"Среднее время до подхода к пустому столу: {avg_delay:.2f} сек",
+                f"Количество циклов уборки/посадки: {len(delays)}",
+                ""
+            ])
+        else:
+            lines.append("Метрики задержки: Данных недостаточно (стол не освобождался или никто не подошел)\n")
+
+        lines.append("2. ХРОНОЛОГИЯ ИНТЕРВАЛОВ:")
+        lines.append("Старт (сек) | Конец (сек) | Состояние  | Длительность")
+        lines.append("------------------------------------------------------")
+        
+        for _, row in df_intervals.iterrows():
+            lines.append(
+                f"{row['start_sec']:>11.2f} | {row['end_sec']:>11.2f} | "
+                f"{row['state']:<10} | {row['duration']:>6.2f}s"
+            )
+
+        with open(self.output_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+        
+        logger.info(f"Интервальный отчет сохранен в: {self.output_path}")
+
+
+class CsvIntervalExportPlugin(BasePlugin):
+    """
+    Плагин для экспорта всех накопленных интервалов состояний в CSV файл.
+    Позволяет сохранить структурированные данные для последующего анализа в Excel/Pandas.
+    """    
+    def __init__(
+        self,
+        output_path: Optional[Path | str],
+        filename: str = "intervals_data.csv",
+    ):
+        self.output_path = Path(output_path or ".") / filename
+
+    def on_process_finished(self, monitor: TableMonitor):
+        """
+        Вызывается один раз в конце обработки видео.
+        Забирает данные из внутреннего контекста монитора через публичный метод.
+        """
+        # Используем встроенный в TableMonitor метод получения DataFrame
+        df = monitor.get_intervals_dataframe()
+
+        if df.empty:
+            logger.warning("Экспорт в CSV: Интервалы не найдены, файл не будет создан.")
+            return
+
+        try:
+            # Сохраняем в CSV
+            # index=False, чтобы не плодить лишнюю колонку с ID строки
+            df.to_csv(self.output_path, index=False, encoding='utf-8-sig')
+            
+            logger.info(f"✅ Данные интервалов успешно экспортированы в CSV: {self.output_path}")
+            print(f"  [CSV Export] Сохранено строк: {len(df)}")
+            
+        except Exception as e:
+            logger.error(f"Ошибка при сохранении CSV: {e}")
+
+    def __repr__(self):
+        return f"CsvIntervalExportPlugin(path='{self.output_path}')"
