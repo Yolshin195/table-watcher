@@ -302,41 +302,74 @@ class TableMonitor:
 
     def get_analytics(self) -> dict:
         """Вычисляет ключевые показатели эффективности (KPI) времени реакции столика."""
-        times = [c.response_time_sec for c in self._ctx.closed_cycles if c.response_time_sec is not None]
+        df = self.get_intervals_dataframe()
+        response_times = []
         
+        if not df.empty:
+            # Ищем пары: интервал EMPTY -> следующий интервал (APPROACH или OCCUPIED)
+            for i in range(len(df) - 1):
+                curr = df.iloc[i]
+                nxt = df.iloc[i+1]
+                
+                if curr['state'] == TableState.EMPTY.name and nxt['state'] in [TableState.APPROACH.name, TableState.OCCUPIED.name]:
+                    # Время реакции: разница между началом нового присутствия и началом периода пустоты
+                    delay = nxt['start_sec'] - curr['start_sec']
+                    response_times.append(delay)
+
         res = {
-            "total_cycles": len(self._ctx.closed_cycles) + len(self._ctx.open_cycles),
-            "completed_cycles": len(self._ctx.closed_cycles),
-            "open_cycles": len(self._ctx.open_cycles),
+            "total_cycles": len(response_times) + (1 if self.state == TableState.EMPTY else 0),
+            "completed_cycles": len(response_times),
+            "open_cycles": 1 if self.state == TableState.EMPTY else 0,
             "mean_response_sec": None,
             "median_response_sec": None,
             "min_response_sec": None,
             "max_response_sec": None,
         }
         
-        if times:
+        if response_times:
             res.update({
-                "mean_response_sec": round(sum(times) / len(times), 2),
-                "median_response_sec": round(sorted(times)[len(times) // 2], 2),
-                "min_response_sec": round(min(times), 2),
-                "max_response_sec": round(max(times), 2),
+                "mean_response_sec": round(sum(response_times) / len(response_times), 2),
+                "median_response_sec": round(sorted(response_times)[len(response_times) // 2], 2),
+                "min_response_sec": round(min(response_times), 2),
+                "max_response_sec": round(max(response_times), 2),
             })
         return res
 
     def get_cycles_dataframe(self) -> pd.DataFrame:
         """Экспортирует данные об устаревших циклах уборки для отчетов."""
-        all_cycles = self._ctx.closed_cycles + self._ctx.open_cycles
-        if not all_cycles:
+        df_int = self.get_intervals_dataframe()
+        records = []
+        
+        for i in range(len(df_int)):
+            curr = df_int.iloc[i]
+            
+            if curr['state'] == TableState.EMPTY.name:
+                record = {
+                    "empty_at_frame": int(curr['frame_start']),
+                    "empty_at_sec": round(curr['start_sec'], 3),
+                    "approach_at_frame": None,
+                    "approach_at_sec": None,
+                    "response_time_sec": None,
+                    "is_completed": False
+                }
+                
+                # Если за пустотой идет активность — цикл завершен
+                if i + 1 < len(df_int):
+                    nxt = df_int.iloc[i+1]
+                    if nxt['state'] in [TableState.APPROACH.name, TableState.OCCUPIED.name]:
+                        record.update({
+                            "approach_at_frame": int(nxt['frame_start']),
+                            "approach_at_sec": round(nxt['start_sec'], 3),
+                            "response_time_sec": round(nxt['start_sec'] - curr['start_sec'], 2),
+                            "is_completed": True
+                        })
+                records.append(record)
+
+        if not records:
             return pd.DataFrame(columns=["empty_at_frame", "empty_at_sec", "approach_at_frame", 
                                          "approach_at_sec", "response_time_sec", "is_completed"])
-        return pd.DataFrame([{
-            "empty_at_frame": c.empty_at_frame,
-            "empty_at_sec": round(c.empty_at_sec, 3),
-            "approach_at_frame": c.approach_at_frame,
-            "approach_at_sec": round(c.approach_at_sec, 3) if c.approach_at_sec else None,
-            "response_time_sec": round(c.response_time_sec, 2) if c.response_time_sec else None,
-            "is_completed": c in self._ctx.closed_cycles,
-        } for c in all_cycles])
+        
+        return pd.DataFrame(records)
 
     def get_events_dataframe(self) -> pd.DataFrame:
         """Экспортирует моментальные события переходов состояний."""

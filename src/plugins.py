@@ -988,8 +988,7 @@ class IntervalAnalyticsPlugin(BasePlugin):
                 f"{row['state']:<10} | {row['duration']:>6.2f}s"
             )
 
-        with open(self.output_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(lines))
+        self.output_path.write_text("\n".join(lines), encoding="utf-8")
         
         logger.info(f"Интервальный отчет сохранен в: {self.output_path}")
 
@@ -1005,6 +1004,13 @@ class CsvIntervalExportPlugin(BasePlugin):
         filename: str = "intervals_data.csv",
     ):
         self.output_path = Path(output_path or ".") / filename
+    
+    def on_frame(self, ctx: FrameContext) -> None:
+        """
+        Реализация абстрактного метода. 
+        Нам не нужно обрабатывать каждый кадр, поэтому просто пропускаем.
+        """
+        pass
 
     def on_process_finished(self, monitor: TableMonitor):
         """
