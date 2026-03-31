@@ -24,6 +24,7 @@ from typing import Optional
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
+import pandas as pd
 
 from src.table_monitor import TableMonitor, TableState
 from src.video_processor import BasePlugin, FrameContext
@@ -520,32 +521,30 @@ class TimelinePlugin(BasePlugin):
 class TimelineChartPlugin(BasePlugin):
     """
     Плагин для генерации финального аналитического графика.
-    Теперь рисует непрерывную ступенчатую линию с цветовой заливкой.
+    Рисует непрерывную ступенчатую линию с цветовой заливкой от t=0 до конца видео.
     """
 
     def __init__(self, output_path: Optional[Path], filename: str = "timeline.png"):
         self.output_dir = Path(output_path or ".")
         self.filename = filename
-        
-        # Цвета для matplotlib
+        self._total_frames: int = 0
+        self._fps: float = 30.0
+
         self._colors_hex = {
-            TableState.EMPTY:    '#00C800',  # Зеленый
-            TableState.OCCUPIED: '#DC0000',  # Красный
-            TableState.APPROACH: '#FFA500',  # Оранжевый
+            TableState.EMPTY:    '#00C800',
+            TableState.OCCUPIED: '#DC0000',
+            TableState.APPROACH: '#FFA500',
         }
 
     def on_start(self, total_frames: int, fps: float, roi: tuple) -> None:
-        # Создаем папку для отчетов заранее
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self._total_frames = total_frames
+        self._fps = fps
 
     def on_frame(self, ctx: FrameContext) -> None:
-        # В процессе работы видео ничего не делаем, чтобы не тратить ресурсы
         pass
 
     def on_finish(self, monitor: TableMonitor) -> None:
-        """
-        Основная логика: берем накопленные данные из монитора и строим график.
-        """
         df = monitor.get_events_dataframe()
         analytics = monitor.get_analytics()
 
@@ -553,60 +552,94 @@ class TimelineChartPlugin(BasePlugin):
             logger.warning("TimelineChartPlugin: события не зафиксированы, график не будет создан.")
             return
 
-        # Подготовка фигуры
-        plt.figure(figsize=(15, 6))
-        
-        # --- НОВАЯ ЛОГИКА ОТРИСОВКИ ---
-        
-        # 1. Рисуем саму линию переходов (ступенчатую)
-        # drawstyle='steps-post' гарантирует, что состояние "держится" до следующей точки
-        plt.plot(
-            df['timestamp_sec'], 
-            df['next_state'], 
-            drawstyle='steps-post', 
-            color='#333333', 
-            linewidth=2, 
+        total_duration = self._total_frames / self._fps if self._fps > 0 else df['timestamp_sec'].max()
+
+        # --- Определяем начальное состояние ---
+        # Первое событие в df — это первый ПЕРЕХОД. Значит, до него было prev_state.
+        initial_state = df.iloc[0]['prev_state']
+
+        start_row = pd.DataFrame([{
+            'timestamp_sec': 0.0,
+            'next_state': initial_state,
+        }])
+
+        middle_rows = df[['timestamp_sec', 'next_state']].copy()
+
+        end_row = pd.DataFrame([{
+            'timestamp_sec': total_duration,
+            'next_state': df.iloc[-1]['next_state'],  # последнее состояние держится до конца
+        }])
+
+        plot_df = pd.concat([start_row, middle_rows, end_row], ignore_index=True)
+
+        # --- Построение графика ---
+        fig, ax = plt.subplots(figsize=(15, 5))
+
+        # 1. Ступенчатая линия
+        ax.plot(
+            plot_df['timestamp_sec'],
+            plot_df['next_state'],
+            drawstyle='steps-post',
+            color='#222222',
+            linewidth=2,
             zorder=4,
-            label='Линия состояний'
+            label='Линия состояний',
         )
 
-        # 2. Заливка цветом интервалов
-        for i in range(len(df) - 1):
-            t_start = df.iloc[i]['timestamp_sec']
-            t_end = df.iloc[i+1]['timestamp_sec']
-            state_name = df.iloc[i]['next_state']
-            
+        # 2. Цветовая заливка интервалов (теперь покрывает весь диапазон [0, total_duration])
+        for i in range(len(plot_df) - 1):
+            t_start = plot_df.iloc[i]['timestamp_sec']
+            t_end   = plot_df.iloc[i + 1]['timestamp_sec']
+            state_name = plot_df.iloc[i]['next_state']
+
             try:
                 state_enum = TableState[state_name]
-                color = self._colors_hex.get(state_enum, 'gray')
+                color = self._colors_hex.get(state_enum, '#999999')
             except KeyError:
-                color = 'gray'
-                
-            plt.axvspan(t_start, t_end, color=color, alpha=0.3, zorder=2)
+                color = '#999999'
 
-        # --- КОНЕЦ НОВОЙ ЛОГИКИ ---
+            ax.axvspan(t_start, t_end, color=color, alpha=0.25, zorder=2)
 
+        # 3. Вертикальные маркеры событий (не считая искусственных точек)
+        for _, row in df.iterrows():
+            ax.axvline(x=row['timestamp_sec'], color='#555555', linewidth=0.8,
+                       linestyle=':', alpha=0.7, zorder=3)
+
+        # --- Оформление ---
         mean_val = analytics.get('mean_response_sec')
         title_text = "Хронология состояний столика"
         if mean_val:
             title_text += f"\nСреднее время между гостями: {mean_val:.1f}с"
 
-        plt.title(title_text, fontsize=14, pad=15)
-        plt.xlabel("Время видео (секунды)", fontsize=12)
-        plt.ylabel("Состояние", fontsize=12)
-        
-        plt.grid(axis='both', linestyle='--', alpha=0.4)
-        # Важно оставить yticks, чтобы на оси были названия состояний
-        plt.yticks(df['next_state'].unique())
-        
-        plt.tight_layout()
-        
-        # Сохранение
+        ax.set_title(title_text, fontsize=14, pad=15)
+        ax.set_xlabel("Время видео (секунды)", fontsize=12)
+        ax.set_ylabel("Состояние", fontsize=12)
+
+        # Фиксируем диапазон X строго [0, total_duration]
+        ax.set_xlim(0, total_duration)
+
+        # Y-тики — все три состояния, даже если не все встречались
+        all_states = [s.name for s in [TableState.APPROACH, TableState.EMPTY, TableState.OCCUPIED]]
+        ax.set_yticks(all_states)
+
+        ax.grid(axis='both', linestyle='--', alpha=0.4)
+
+        # Легенда цветов состояний
+        from matplotlib.patches import Patch
+        legend_elements = [
+            Patch(facecolor=self._colors_hex[TableState.EMPTY],    alpha=0.5, label='EMPTY'),
+            Patch(facecolor=self._colors_hex[TableState.APPROACH],  alpha=0.5, label='APPROACH'),
+            Patch(facecolor=self._colors_hex[TableState.OCCUPIED],  alpha=0.5, label='OCCUPIED'),
+        ]
+        ax.legend(handles=legend_elements, loc='upper right', fontsize=10)
+
+        fig.tight_layout()
+
         save_path = self.output_dir / self.filename
-        plt.savefig(str(save_path), dpi=200)
-        plt.close()
-        
-        logger.info("TimelineChartPlugin: Аналитический график сохранен в %s", save_path)
+        fig.savefig(str(save_path), dpi=200)
+        plt.close(fig)
+
+        logger.info("TimelineChartPlugin: график сохранён в %s", save_path)
 
 
 class TableProgressBarPlugin(BasePlugin):
