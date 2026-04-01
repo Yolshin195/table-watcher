@@ -256,6 +256,7 @@ def _build_plugins(args: argparse.Namespace, output_path: Path) -> list:
         UnifiedHistoryLogger,
         IntervalAnalyticsPlugin,
         CsvIntervalExportPlugin,
+        TaskReportPlugin,
     )
 
     plugins = []
@@ -278,6 +279,7 @@ def _build_plugins(args: argparse.Namespace, output_path: Path) -> list:
 
     plugins.append(IntervalAnalyticsPlugin(output_path=output_path))
     plugins.append(CsvIntervalExportPlugin(output_path=output_path))
+    plugins.append(TaskReportPlugin(output_path=output_path))
 
     # Текстовый отчёт
     plugins.append(ReportPlugin(

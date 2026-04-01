@@ -28,6 +28,7 @@ import pandas as pd
 
 from src.table_monitor import TableMonitor, TableState
 from src.video_processor import BasePlugin, FrameContext
+from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
@@ -341,11 +342,12 @@ class ReportPlugin(BasePlugin):
         if not cyc.empty:
             lines += ["", "  Циклы (стол освободился → подход)", "  " + "─" * 36]
             for _, row in cyc.iterrows():
-                rt = f"{row['response_time_sec']:.1f}s" if row["response_time_sec"] else "—"
+                rt = f"{row['response_time_sec']:.1f}s" if pd.notna(row["response_time_sec"]) else "—"
                 status = "OK" if row["is_completed"] else "open"
+                # approach_at_sec может быть None или NaN — _ts() теперь обрабатывает оба
                 lines.append(
                     f"  empty={self._ts(row['empty_at_sec'])}"
-                    f"  approach={self._ts(row['approach_at_sec']) if row['approach_at_sec'] else '—'}"
+                    f"  approach={self._ts(row['approach_at_sec'])}"
                     f"  delta={rt}  [{status}]"
                 )
 
@@ -360,9 +362,11 @@ class ReportPlugin(BasePlugin):
 
     @staticmethod
     def _ts(sec: Optional[float]) -> str:
-        if sec is None:
+        # ИСПРАВЛЕНИЕ: pandas заменяет Python-None на float NaN при смешанных
+        # типах в DataFrame. Проверка `sec is None` NaN не ловит — нужен pd.isna().
+        if sec is None or (isinstance(sec, float) and pd.isna(sec)):
             return "—"
-        m, s = divmod(sec, 60)
+        m, s = divmod(float(sec), 60)
         h, m = divmod(m, 60)
         return f"{int(h):02d}:{int(m):02d}:{s:05.2f}"
 
@@ -476,37 +480,31 @@ class TimelinePlugin(BasePlugin):
         self._history = []
 
     def on_frame(self, ctx: FrameContext) -> None:
-        # 1. Запоминаем текущее состояние для истории
+        # Добавляем текущее состояние в историю
         self._history.append(ctx.state)
-        
-        # 2. Логика отрисовки таймлайна
+
         h, w = ctx.frame.shape[:2]
-        
         if self._total_frames <= 0:
             return
 
-        # Рассчитываем ширину шага для одного кадра
         step = w / self._total_frames
-        
-        # Отрисовываем накопленную историю
-        # Для оптимизации: если видео очень длинное, можно рисовать не каждый кадр,
-        # а группировать их, но при текущей логике рисуем всё накопленное.
-        for i, state in enumerate(self._history):
-            x_start = int(i * step)
-            x_end = int((i + 1) * step)
-            
-            color = self._colors.get(state, (100, 100, 100))
-            
-            # Рисуем сегмент таймлайна внизу кадра
-            cv2.rectangle(
-                ctx.frame, 
-                (x_start, h - self.bar_height), 
-                (x_end, h), 
-                color, 
-                -1
-            )
-            
-        # Опционально: рисуем тонкую рамку или разделитель над таймлайном
+
+        # ИСПРАВЛЕНИЕ O(n²) → O(1): рисуем только текущий сегмент,
+        # а не всю историю с нуля на каждом кадре.
+        i = len(self._history) - 1
+        x_start = int(i * step)
+        x_end   = max(x_start + 1, int((i + 1) * step))  # минимум 1px
+
+        color = self._colors.get(ctx.state, (100, 100, 100))
+        cv2.rectangle(
+            ctx.frame,
+            (x_start, h - self.bar_height),
+            (x_end,   h),
+            color,
+            -1,
+        )
+
+        # Разделитель над таймлайном
         cv2.line(ctx.frame, (0, h - self.bar_height), (w, h - self.bar_height), (255, 255, 255), 1)
 
     def on_finish(self, monitor: TableMonitor) -> None:
@@ -1037,3 +1035,392 @@ class CsvIntervalExportPlugin(BasePlugin):
 
     def __repr__(self):
         return f"CsvIntervalExportPlugin(path='{self.output_path}')"
+
+
+"""
+TaskReportPlugin — плагин аналитики, закрывающий 100% требований ТЗ.
+
+Бизнес-цикл (единица измерения):
+    OCCUPIED → EMPTY → APPROACH
+    │           │         │
+    │           │         └─ новый гость подошёл
+    │           └─────────── стол пустой (ждём уборки/нового гостя)
+    └─────────────────────── предыдущий гость сидел
+
+Только такая тройка считается валидным циклом.
+EMPTY в начале видео (без предшествующего OCCUPIED) — не цикл.
+OCCUPIED→EMPTY в конце без APPROACH — открытый цикл.
+
+Главная метрика ТЗ:
+    wait_time = EMPTY.duration = APPROACH.start_sec − OCCUPIED.end_sec
+    «Сколько стол простоял пустым между гостями»
+"""
+# ---------------------------------------------------------------------------
+# Структура одного цикла
+# ---------------------------------------------------------------------------
+
+@dataclass
+class TableCycle:
+    """
+    Валидный бизнес-цикл: тройка OCCUPIED → EMPTY → APPROACH.
+
+    Поля:
+        occupied_start_sec  — гость сел
+        occupied_end_sec    — гость встал (стол освободился)
+        empty_start_sec     — начало пустого периода (= occupied_end_sec)
+        empty_end_sec       — конец пустого периода (следующий подошёл)
+        approach_start_sec  — новый гость подошёл
+        occupied_duration   — сколько сидел предыдущий гость (сек)
+        wait_time           — сколько стол простоял пустым (сек) ← МЕТРИКА ТЗ
+        is_complete         — True если APPROACH найден
+    """
+    occupied_start_sec: float
+    occupied_end_sec:   float
+    empty_start_sec:    float
+    empty_end_sec:      Optional[float]
+    approach_start_sec: Optional[float]
+
+    @property
+    def occupied_duration(self) -> float:
+        return round(self.occupied_end_sec - self.occupied_start_sec, 3)
+
+    @property
+    def wait_time(self) -> Optional[float]:
+        """Время пустоты: от ухода гостя до прихода следующего."""
+        if self.approach_start_sec is None:
+            return None
+        return round(self.approach_start_sec - self.occupied_end_sec, 3)
+
+    @property
+    def is_complete(self) -> bool:
+        return self.approach_start_sec is not None
+
+
+# ---------------------------------------------------------------------------
+# Основная логика построения циклов
+# ---------------------------------------------------------------------------
+
+def build_cycles(df: pd.DataFrame) -> list[TableCycle]:
+    """
+    Находит все валидные тройки OCCUPIED → EMPTY → APPROACH в списке интервалов.
+
+    Алгоритм:
+        Проходим по df слева направо.
+        Как только видим OCCUPIED — цикл открыт.
+        Следующий интервал должен быть EMPTY — фиксируем.
+        Следующий за ним APPROACH — цикл закрыт (валидный).
+        Если после EMPTY идёт не APPROACH — цикл открытый (без нового гостя).
+        Если OCCUPIED не предшествует — EMPTY/APPROACH не считаем.
+
+    Args:
+        df: DataFrame из monitor.get_intervals_dataframe()
+            Колонки: state, start_sec, end_sec, duration, frame_start, frame_end
+
+    Returns:
+        Список TableCycle, отсортированный по времени.
+    """
+    cycles: list[TableCycle] = []
+    i = 0
+    n = len(df)
+
+    while i < n:
+        row = df.iloc[i]
+
+        # Ищем начало цикла — интервал OCCUPIED
+        if row["state"] != "OCCUPIED":
+            i += 1
+            continue
+
+        occupied = row  # Нашли OCCUPIED
+
+        # Следующий интервал должен быть EMPTY
+        if i + 1 >= n:
+            # OCCUPIED в самом конце, нет EMPTY — открытый цикл без пустоты
+            cycles.append(TableCycle(
+                occupied_start_sec=occupied["start_sec"],
+                occupied_end_sec=  occupied["end_sec"],
+                empty_start_sec=   occupied["end_sec"],
+                empty_end_sec=     None,
+                approach_start_sec=None,
+            ))
+            i += 1
+            continue
+
+        nxt = df.iloc[i + 1]
+
+        if nxt["state"] != "EMPTY":
+            # После OCCUPIED идёт не EMPTY (теоретически невозможно в нашем FSM,
+            # но защищаемся)
+            i += 1
+            continue
+
+        empty = nxt  # Нашли EMPTY после OCCUPIED
+
+        # Ищем APPROACH после EMPTY
+        if i + 2 >= n:
+            # OCCUPIED→EMPTY в конце видео, APPROACH не успел — открытый цикл
+            cycles.append(TableCycle(
+                occupied_start_sec=occupied["start_sec"],
+                occupied_end_sec=  occupied["end_sec"],
+                empty_start_sec=   empty["start_sec"],
+                empty_end_sec=     empty["end_sec"],
+                approach_start_sec=None,
+            ))
+            i += 2
+            continue
+
+        after_empty = df.iloc[i + 2]
+
+        if after_empty["state"] in ("APPROACH", "OCCUPIED"):
+            # Полный цикл: OCCUPIED → EMPTY → APPROACH
+            cycles.append(TableCycle(
+                occupied_start_sec=occupied["start_sec"],
+                occupied_end_sec=  occupied["end_sec"],
+                empty_start_sec=   empty["start_sec"],
+                empty_end_sec=     empty["end_sec"],
+                approach_start_sec=after_empty["start_sec"],
+            ))
+            # Продолжаем с APPROACH/OCCUPIED — он может быть началом следующего цикла
+            i += 2
+        else:
+            # После EMPTY снова EMPTY или неожиданное состояние — открытый цикл
+            cycles.append(TableCycle(
+                occupied_start_sec=occupied["start_sec"],
+                occupied_end_sec=  occupied["end_sec"],
+                empty_start_sec=   empty["start_sec"],
+                empty_end_sec=     empty["end_sec"],
+                approach_start_sec=None,
+            ))
+            i += 2
+
+    return cycles
+
+
+def cycles_to_dataframe(cycles: list[TableCycle]) -> pd.DataFrame:
+    """Конвертирует список циклов в DataFrame для отчёта и CSV."""
+    if not cycles:
+        return pd.DataFrame(columns=[
+            "occupied_start_sec", "occupied_end_sec", "occupied_duration",
+            "empty_start_sec", "empty_end_sec",
+            "approach_start_sec", "wait_time", "is_complete",
+        ])
+    return pd.DataFrame([{
+        "occupied_start_sec": c.occupied_start_sec,
+        "occupied_end_sec":   c.occupied_end_sec,
+        "occupied_duration":  c.occupied_duration,
+        "empty_start_sec":    c.empty_start_sec,
+        "empty_end_sec":      c.empty_end_sec,
+        "approach_start_sec": c.approach_start_sec,
+        "wait_time":          c.wait_time,      # ← главная метрика ТЗ
+        "is_complete":        c.is_complete,
+    } for c in cycles])
+
+
+# ---------------------------------------------------------------------------
+# Форматтеры
+# ---------------------------------------------------------------------------
+
+def _fmt_ts(sec: Optional[float]) -> str:
+    if sec is None or (isinstance(sec, float) and pd.isna(sec)):
+        return "--:--.--"
+    m, s = divmod(float(sec), 60)
+    return f"{int(m):02d}:{s:05.2f}"
+
+
+def _fmt_dur(sec: Optional[float]) -> str:
+    if sec is None or (isinstance(sec, float) and pd.isna(sec)):
+        return "    --"
+    return f"{float(sec):6.1f}s"
+
+
+# ---------------------------------------------------------------------------
+# TaskReportPlugin
+# ---------------------------------------------------------------------------
+
+class TaskReportPlugin(BasePlugin):
+    """
+    Единственный аналитический плагин для ТЗ.
+
+    on_frame()  — ничего не делает (ноль overhead на горячем пути)
+    on_finish() — строит циклы OCCUPIED→EMPTY→APPROACH постфактум,
+                  считает метрики, сохраняет report.txt и cycles.csv
+
+    Args:
+        output_path: папка сессии
+        video_path:  путь к видео (для отчёта)
+        report_name: имя текстового отчёта (default: report.txt)
+        csv_name:    имя CSV с циклами (default: cycles.csv)
+    """
+
+    def __init__(
+        self,
+        output_path: Optional[Path | str] = None,
+        video_path:  str = "",
+        report_name: str = "report.txt",
+        csv_name:    str = "cycles.csv",
+    ):
+        self._base   = Path(output_path or ".")
+        self._video  = video_path
+        self._report = self._base / report_name
+        self._csv    = self._base / csv_name
+
+        self._roi:   Optional[tuple] = None
+        self._total: int   = 0
+        self._fps:   float = 30.0
+
+    def on_start(self, total_frames: int, fps: float, roi: tuple) -> None:
+        self._roi   = roi
+        self._total = total_frames
+        self._fps   = fps
+        self._base.mkdir(parents=True, exist_ok=True)
+
+    def on_frame(self, ctx: FrameContext) -> None:
+        pass  # Вся логика в on_finish — никакого overhead
+
+    def on_finish(self, monitor: TableMonitor) -> None:
+        df_intervals = monitor.get_intervals_dataframe()
+
+        if df_intervals.empty:
+            logger.warning("TaskReportPlugin: интервалов нет — отчёт не создан.")
+            return
+
+        # Строим циклы OCCUPIED → EMPTY → APPROACH
+        cycles    = build_cycles(df_intervals)
+        df_cycles = cycles_to_dataframe(cycles)
+
+        # Сохраняем
+        self._save_csv(df_cycles)
+        self._save_report(df_intervals, df_cycles, cycles)
+
+    # ------------------------------------------------------------------
+    # CSV
+    # ------------------------------------------------------------------
+
+    def _save_csv(self, df: pd.DataFrame) -> None:
+        try:
+            df.to_csv(self._csv, index=False, encoding="utf-8-sig")
+            logger.info("TaskReportPlugin: CSV → %s  (%d циклов)", self._csv, len(df))
+        except Exception as exc:
+            logger.error("TaskReportPlugin: ошибка CSV: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Текстовый отчёт
+    # ------------------------------------------------------------------
+
+    def _save_report(
+        self,
+        df_intervals: pd.DataFrame,
+        df_cycles:    pd.DataFrame,
+        cycles:       list[TableCycle],
+    ) -> None:
+        lines = self._build_report(df_intervals, df_cycles, cycles)
+        try:
+            self._report.write_text("\n".join(lines), encoding="utf-8")
+            logger.info("TaskReportPlugin: отчёт → %s", self._report)
+            print(f"\n✅  Отчёт ТЗ    → {self._report}")
+            print(f"📊  Циклы CSV   → {self._csv}")
+        except Exception as exc:
+            logger.error("TaskReportPlugin: ошибка отчёта: %s", exc)
+
+    def _build_report(
+        self,
+        df_intervals: pd.DataFrame,
+        df_cycles:    pd.DataFrame,
+        cycles:       list[TableCycle],
+    ) -> list[str]:
+        roi = self._roi or (0, 0, 0, 0)
+        SEP  = "=" * 62
+        THIN = "─" * 62
+
+        complete   = [c for c in cycles if c.is_complete]
+        incomplete = [c for c in cycles if not c.is_complete]
+        wait_times = [c.wait_time for c in complete]
+
+        # ── Шапка ────────────────────────────────────────────────────
+        lines = [
+            SEP,
+            "   ОТЧЁТ: ДЕТЕКЦИЯ УБОРКИ СТОЛИКОВ  (требования ТЗ)",
+            SEP,
+            f"  Видео:    {self._video or '—'}",
+            f"  ROI:      x={roi[0]}  y={roi[1]}  w={roi[2]}  h={roi[3]}",
+            f"  Кадров:   {self._total}  |  FPS: {self._fps:.1f}",
+            "",
+        ]
+
+        # ── 1. Основная метрика ТЗ ────────────────────────────────────
+        lines += [
+            "  1. ОСНОВНАЯ МЕТРИКА ТЗ",
+            "  " + THIN,
+            "  Цикл: OCCUPIED → EMPTY → APPROACH",
+            "  Метрика: время пустоты между гостями (APPROACH.start − OCCUPIED.end)",
+            "",
+        ]
+
+        if wait_times:
+            avg    = sum(wait_times) / len(wait_times)
+            median = sorted(wait_times)[len(wait_times) // 2]
+            lines += [
+                f"      Завершённых циклов : {len(complete)}",
+                f"      Открытых циклов   : {len(incomplete)}  (нет следующего APPROACH)",
+                "",
+                f"      Среднее время пустоты  : {avg:.2f} сек",
+                f"      Медиана                : {median:.2f} сек",
+                f"      Минимум                : {min(wait_times):.2f} сек",
+                f"      Максимум               : {max(wait_times):.2f} сек",
+            ]
+        else:
+            lines += [
+                f"      Завершённых циклов : 0",
+                f"      Открытых циклов   : {len(incomplete)}",
+                "      Данных недостаточно — нет полной тройки OCCUPIED→EMPTY→APPROACH",
+            ]
+
+        lines.append("")
+
+        # ── 2. Детализация циклов ────────────────────────────────────
+        lines += [
+            "  2. ДЕТАЛИЗАЦИЯ ЦИКЛОВ  (OCCUPIED → EMPTY → APPROACH)",
+            "  " + THIN,
+            f"  {'№':>3}  {'Гость сел':>10}  {'Ушёл':>10}  "
+            f"{'Сидел':>8}  {'Ждали':>8}  {'Подошли':>10}  Статус",
+            "  " + "─" * 60,
+        ]
+
+        if not cycles:
+            lines.append("  (циклов не зафиксировано)")
+        else:
+            for idx, c in enumerate(cycles, 1):
+                status = "✓ полный" if c.is_complete else "○ открыт"
+                lines.append(
+                    f"  {idx:>3}.  "
+                    f"{_fmt_ts(c.occupied_start_sec):>10}  "
+                    f"{_fmt_ts(c.occupied_end_sec):>10}  "
+                    f"{_fmt_dur(c.occupied_duration):>8}  "
+                    f"{_fmt_dur(c.wait_time):>8}  "
+                    f"{_fmt_ts(c.approach_start_sec):>10}  "
+                    f"{status}"
+                )
+
+        lines.append("")
+
+        # ── 3. Полная хронология интервалов ──────────────────────────
+        lines += [
+            "  3. ХРОНОЛОГИЯ ИНТЕРВАЛОВ",
+            "  " + THIN,
+            f"  {'Старт':>10}  {'Конец':>10}  {'Длит.':>8}  Состояние",
+            "  " + "─" * 46,
+        ]
+
+        for _, row in df_intervals.iterrows():
+            lines.append(
+                f"  {_fmt_ts(row['start_sec']):>10}  "
+                f"{_fmt_ts(row['end_sec']):>10}  "
+                f"{row['duration']:>6.2f} s  "
+                f"{row['state']}"
+            )
+
+        lines += ["", SEP]
+        return lines
+
+    def __repr__(self) -> str:
+        return f"TaskReportPlugin(report='{self._report}', csv='{self._csv}')"
