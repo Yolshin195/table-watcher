@@ -460,16 +460,15 @@ class LiveViewPlugin(BasePlugin):
 class TimelinePlugin(BasePlugin):
     """
     Отрисовывает динамический таймлайн в нижней части кадра.
-    Цвет полоски соответствует состоянию стола в конкретный момент времени.
+    Использует внутренний буфер (canvas) для достижения O(1) производительности.
     """
 
     def __init__(self, bar_height: int = 35):
         self.bar_height = bar_height
         self._total_frames: int = 0
-        # Храним историю состояний для отрисовки всей полоски на каждом кадре
-        self._history: list[TableState] = []
+        self._canvas: Optional[np.ndarray] = None
         
-        # Используем те же цвета, что и в основной системе
+        # Цвета в формате BGR
         self._colors = {
             TableState.EMPTY:    (0, 255, 0),    # Зеленый
             TableState.OCCUPIED: (0, 0, 255),    # Красный
@@ -478,40 +477,51 @@ class TimelinePlugin(BasePlugin):
 
     def on_start(self, total_frames: int, fps: float, roi: tuple) -> None:
         self._total_frames = total_frames
-        self._history = []
+        # Сбрасываем холст при каждом новом запуске
+        self._canvas = None
 
     def on_frame(self, ctx: FrameContext) -> None:
-        # Добавляем текущее состояние в историю
-        self._history.append(ctx.state)
-
         h, w = ctx.frame.shape[:2]
+        
         if self._total_frames <= 0:
             return
 
-        step = w / self._total_frames
+        # 1. Инициализируем холст-буфер один раз под размер видео
+        if self._canvas is None:
+            # Создаем черную полоску высотой bar_height и шириной с кадр
+            self._canvas = np.zeros((self.bar_height, w, 3), dtype=np.uint8)
 
-        # ИСПРАВЛЕНИЕ O(n²) → O(1): рисуем только текущий сегмент,
-        # а не всю историю с нуля на каждом кадре.
-        i = len(self._history) - 1
-        x_start = int(i * step)
-        x_end   = max(x_start + 1, int((i + 1) * step))  # минимум 1px
+        # 2. Рисуем ТОЛЬКО новый сегмент на нашем холсте (O(1))
+        step = w / self._total_frames
+        x_start = int(ctx.frame_no * step)
+        x_end = max(x_start + 1, int((ctx.frame_no + 1) * step))
 
         color = self._colors.get(ctx.state, (100, 100, 100))
+        
+        # Рисуем на холсте (от 0 до bar_height)
         cv2.rectangle(
-            ctx.frame,
-            (x_start, h - self.bar_height),
-            (x_end,   h),
+            self._canvas,
+            (x_start, 0),
+            (x_end, self.bar_height),
             color,
-            -1,
+            -1
         )
 
-        # Разделитель над таймлайном
-        cv2.line(ctx.frame, (0, h - self.bar_height), (w, h - self.bar_height), (255, 255, 255), 1)
+        # 3. Копируем накопленный холст в нижнюю часть текущего кадра (быстрая операция массива)
+        ctx.frame[h - self.bar_height : h, 0 : w] = self._canvas
+
+        # 4. Рисуем разделительную линию поверх
+        cv2.line(
+            ctx.frame, 
+            (0, h - self.bar_height), 
+            (w, h - self.bar_height), 
+            (255, 255, 255), 
+            1
+        )
 
     def on_finish(self, monitor: TableMonitor) -> None:
-        # Очищаем историю после завершения, чтобы не держать память
-        self._history.clear()
-
+        # Освобождаем память
+        self._canvas = None
 
 # ---------------------------------------------------------------------------
 # 9. TimelineChartPlugin — генерирует PNG-график истории состояний
