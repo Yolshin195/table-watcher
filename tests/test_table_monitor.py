@@ -16,7 +16,7 @@
 
 import pandas as pd
 import pytest
-from src.table_monitor import TableMonitor, TableState, StateTransition, CleanupRecord
+from src.table_monitor import TableMonitor, TableState, StateTransition
 
 
 # ---------------------------------------------------------------------------
