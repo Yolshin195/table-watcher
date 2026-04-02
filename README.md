@@ -58,14 +58,14 @@
 
 ```bash
 # Минимальный запуск — откроется окно выбора зоны столика
-python main.py --video video1.mp4
+python main.py --video videos/video_2.mp4 --live
 
 # С явными координатами зоны (без интерактивного выбора)
-python main.py --video video1.mp4 --roi 120 80 240 160
+python main.py --video videos/video_2.mp4 --live --roi 285 160 1036 890
 
 # Полный запуск с визуализацией в окне
-python main.py --video video1.mp4 \
-    --roi 120 80 240 160 \
+python main.py --video videos/video_2.mp4 \
+    --roi 285 160 1036 890 \
     --live \
     --confidence 0.45 \
     --empty-frames 200 \
