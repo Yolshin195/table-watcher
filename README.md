@@ -63,6 +63,12 @@ python main.py --video videos/video_2.mp4 --live
 # С явными координатами зоны (без интерактивного выбора)
 python main.py --video videos/video_2.mp4 --live --roi 285 160 1036 890
 
+# С пропуском кадров, чтобы ускорить обработку
+python main.py --video videos/video_2.mp4 --live --roi 285 160 1036 890 --step 20
+
+# Запуск без показа окна, работает значительно быстрее
+python main.py --video videos/video_2.mp4 --step 20
+
 # Полный запуск с визуализацией в окне
 python main.py --video videos/video_2.mp4 \
     --roi 285 160 1036 890 \
@@ -95,11 +101,12 @@ pip install -r requirements.txt
 **`requirements.txt`:**
 
 ```
-ultralytics>=8.0.0
-opencv-python>=4.8.0
-pandas>=2.0.0
-matplotlib>=3.7.0
-numpy>=1.24.0
+pandas==3.0.1
+pytest==9.0.2
+opencv-python==4.13.0.92
+ultralytics==8.4.30
+
+gdown==5.2.1
 ```
 
 > ⚠️ При первом запуске Ultralytics автоматически загрузит веса модели **YOLOv8n** (~6 МБ).  
@@ -273,17 +280,20 @@ usage: main.py [-h] --video PATH [--roi X Y W H]
 
 ```
 table-monitor/
-├── main.py                         # Точка входа, CLI
+├── main.py                         # Точка входа, CLI (Для удобства запуска)
 ├── requirements.txt
 ├── README.md
 ├── settings/
 │   └── table_config.json           # Сохранённые ROI по именам видеофайлов
 ├── src/
 │   ├── __init__.py
+│   ├── main.py                     # Точка входа, CLI
 │   ├── table_monitor.py            # FSM-логика (TableMonitor, состояния, интервалы)
 │   ├── video_processor.py          # Цикл обработки видео, детекция YOLO, BasePlugin
 │   ├── plugins.py                  # Все встроенные плагины
 │   └── utils/
+│       ├── __init__.py
+│       ├── formatters.py           # Форматтеры
 │       ├── roi_manager.py          # Загрузка / интерактивный выбор ROI
 │       └── session_dir.py          # Создание папки сессии с timestamp
 └── outputs/
@@ -306,25 +316,41 @@ table-monitor/
 ### `report.txt` (TaskReportPlugin)
 
 ```
-==============================================================
-   ОТЧЁТ: ДЕТЕКЦИЯ УБОРКИ СТОЛИКОВ  (требования ТЗ)
-==============================================================
-  Видео:    video1.mp4
-  ROI:      x=120  y=80  w=240  h=160
-  Кадров:   9000  |  FPS: 30.0
+======================================================
+  Отчёт: детекция уборки столиков
+======================================================
+  Видео:          videos/video_2.mp4
+  ROI:            x=285 y=160 w=1036 h=890
+  Всего кадров:   14341
+  FPS:            15.0
 
-  1. ОСНОВНАЯ МЕТРИКА ТЗ
-  ──────────────────────────────────────────────────────────
-  Цикл: OCCUPIED → EMPTY → APPROACH
-  Метрика: время пустоты между гостями (APPROACH.start − OCCUPIED.end)
+  Аналитика
+  ────────────────────────────────────
+  Циклов завершено:  1
+  Циклов открытых:   0
+  Среднее время:     78.33 сек
+  Медиана:           78.33 сек
+  Минимум:           78.33 сек
+  Максимум:          78.33 сек
 
-      Завершённых циклов : 4
-      Открытых циклов   : 1  (нет следующего APPROACH)
+  События
+  ────────────────────────────────────
+  00:03:54.60  OCCUPIED → EMPTY
+  00:05:12.93  EMPTY    → APPROACH
+  00:05:27.93  APPROACH → EMPTY
+  00:06:38.27  EMPTY    → APPROACH
+  00:06:58.60  APPROACH → EMPTY
+  00:07:31.60  EMPTY    → APPROACH
+  00:07:59.93  APPROACH → EMPTY
+  00:09:39.60  EMPTY    → APPROACH
+  00:09:57.27  APPROACH → EMPTY
+  00:09:58.27  EMPTY    → APPROACH
+  00:10:13.27  APPROACH → EMPTY
 
-      Среднее время пустоты  : 34.20 сек
-      Медиана                : 28.50 сек
-      Минимум                : 12.10 сек
-      Максимум               : 67.80 сек
+  Циклы (стол освободился → подход)
+  ────────────────────────────────────
+  empty=00:03:54.60  approach=00:05:12.93  delta=78.3s  [OK]
+======================================================
 ```
 
 ### `timeline.png`
@@ -340,8 +366,7 @@ table-monitor/
 
 ```csv
 occupied_start_sec,occupied_end_sec,occupied_duration,empty_start_sec,empty_end_sec,approach_start_sec,wait_time,is_complete
-12.3,87.5,75.2,87.5,99.6,99.6,12.1,True
-134.0,201.3,67.3,201.3,229.8,229.8,28.5,True
+0.0,234.6,234.6,234.6,312.933,312.933,78.333,True
 ```
 
 ---

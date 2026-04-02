@@ -28,8 +28,8 @@ import pandas as pd
 
 from src.table_monitor import TableMonitor, TableState
 from src.video_processor import BasePlugin, FrameContext
-from src.utils.formatters import _fmt_dur, _fmt_ts
 from src.cycles import TableCycle, build_cycles, cycles_to_dataframe
+from src.utils.formatters import _fmt_dur, _fmt_ts
 
 logger = logging.getLogger(__name__)
 
@@ -343,12 +343,11 @@ class ReportPlugin(BasePlugin):
         if not cyc.empty:
             lines += ["", "  Циклы (стол освободился → подход)", "  " + "─" * 36]
             for _, row in cyc.iterrows():
-                rt = f"{row['response_time_sec']:.1f}s" if pd.notna(row["response_time_sec"]) else "—"
-                status = "OK" if row["is_completed"] else "open"
-                # approach_at_sec может быть None или NaN — _ts() теперь обрабатывает оба
+                rt = f"{row['wait_time']:.1f}s" if pd.notna(row["wait_time"]) else "—"
+                status = "OK" if row["is_complete"] else "open"
                 lines.append(
-                    f"  empty={self._ts(row['empty_at_sec'])}"
-                    f"  approach={self._ts(row['approach_at_sec'])}"
+                    f"  empty={self._ts(row['empty_start_sec'])}"
+                    f"  approach={self._ts(row['approach_start_sec'])}"
                     f"  delta={rt}  [{status}]"
                 )
 
@@ -812,109 +811,6 @@ class UnifiedHistoryLogger(BasePlugin):
         if a['mean_response_sec']:
             print(f"📊 СРЕДНЕЕ ВРЕМЯ МЕЖДУ ГОСТЯМИ (ТЗ): {a['mean_response_sec']} сек")
         print("="*95 + "\n")
-
-
-class BusinessAnalyticsPlugin(BasePlugin):
-    """
-    Финальный плагин отчета, полностью соответствующий ТЗ.
-    Считает:
-    1. Среднее время простоя (EMPTY -> APPROACH) — требование ТЗ.
-    2. Среднее время обслуживания (длительность OCCUPIED).
-    3. Статистику всех подходов (включая тех, кто не сел).
-    """
-    def __init__(
-        self,
-        output_path: Optional[Path | str],
-        filename: str = "business_report.txt",
-        video_path: str = ""
-    ):
-        self.output_path = Path(output_path or ".") / filename
-        self.video_path = video_path
-        self._roi = None
-
-    def on_start(self, total_frames: int, fps: float, roi: tuple) -> None:
-        self._roi = roi
-        self._fps = fps
-    
-    def on_frame(self, ctx: FrameContext) -> None:
-        """
-        Реализация абстрактного метода. 
-        Нам не нужно обрабатывать каждый кадр, поэтому просто пропускаем.
-        """
-        pass
-
-    def on_finish(self, monitor: TableMonitor) -> None:
-        # Получаем данные из монитора
-        df_events = monitor.get_events_dataframe()
-        df_cycles = monitor.get_cycles_dataframe() # Здесь наши исправленные циклы
-
-        if df_events.empty:
-            logger.warning("Нет событий для формирования отчета.")
-            return
-
-        # --- 1. Расчет метрики ТЗ: EMPTY -> APPROACH ---
-        # Берем все случаи, где зафиксирован подход (даже если цикл не завершен)
-        wait_times = df_cycles['response_time_sec'].dropna().tolist()
-        avg_wait = sum(wait_times) / len(wait_times) if wait_times else 0
-
-        # --- 2. Расчет времени "Стол занят" (OCCUPIED) ---
-        # Считаем разницу между входом в OCCUPIED и выходом из него
-        occupied_durations = []
-        occ_start = None
-        for _, row in df_events.iterrows():
-            if row['next_state'] == 'OCCUPIED':
-                occ_start = row['timestamp_sec']
-            elif row['prev_state'] == 'OCCUPIED' and occ_start is not None:
-                occupied_durations.append(row['timestamp_sec'] - occ_start)
-                occ_start = None
-        
-        avg_occupied = sum(occupied_durations) / len(occupied_durations) if occupied_durations else 0
-
-        # --- 3. Статистика прохожих (EMPTY -> APPROACH -> EMPTY) ---
-        # Это циклы, которые остались в статусе is_completed = False, но имеют approach_at
-        false_approaches = df_cycles[(df_cycles['is_completed'] == False) & (df_cycles['approach_at_sec'].notna())]
-
-        # Формируем текст отчета
-        lines = [
-            "======================================================",
-            "        ИТОГОВЫЙ БИЗНЕС-ОТЧЕТ (ПО ТРЕБОВАНИЯМ ТЗ)",
-            "======================================================",
-            f"Видео файл:      {self.video_path}",
-            f"Зона стола (ROI): x={self._roi[0]}, y={self._roi[1]}, w={self._roi[2]}, h={self._roi[3]}",
-            "------------------------------------------------------",
-            "1. ОСНОВНАЯ МЕТРИКА ТЗ",
-            f"Среднее время между уходом гостя и подходом: {avg_wait:.2f} сек",
-            f"Всего зафиксировано подходов к столу:        {len(wait_times)}",
-            "",
-            "2. АНАЛИТИКА ЗАЯТОСТИ",
-            f"Среднее время, пока стол был ЗАНЯТ:          {avg_occupied:.2f} сек",
-            f"Количество подтвержденных посадок:           {len(occupied_durations)}",
-            "",
-            "3. СТАТИСТИКА ПОДХОДОВ (Прохожие/Официанты)",
-            f"Случаи 'Approach -> Empty' (не сели):        {len(false_approaches)}",
-            "------------------------------------------------------",
-            "ПОДРОБНЫЙ ЛОГ ЦИКЛОВ:",
-            "Освободился | Подошли     | Задержка | Статус"
-        ]
-
-        for _, row in df_cycles.iterrows():
-            empty_ts = self._fmt_ts(row['empty_at_sec'])
-            appr_ts  = self._fmt_ts(row['approach_at_sec'])
-            delay    = f"{row['response_time_sec']:>6.1f}s" if row['response_time_sec'] else "      --"
-            status   = "ПОСАДКА" if row['is_completed'] else "ПРОХОЖИЙ"
-            lines.append(f"{empty_ts}    | {appr_ts}    | {delay} | {status}")
-
-        lines.append("======================================================")
-
-        # Сохранение
-        self.output_path.write_text("\n".join(lines), encoding="utf-8")
-        print(f"\n✅ Текстовый отчет по ТЗ сохранен в: {self.output_path}")
-
-    @staticmethod
-    def _fmt_ts(sec):
-        if sec is None or pd.isna(sec): return "--:--:--"
-        m, s = divmod(sec, 60)
-        return f"{int(m):02d}:{s:05.2f}"
 
 
 class IntervalAnalyticsPlugin(BasePlugin):

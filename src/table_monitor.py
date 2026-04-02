@@ -38,6 +38,8 @@
 
 from __future__ import annotations
 
+from src.cycles import build_cycles, cycles_to_dataframe
+
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum, auto
@@ -346,72 +348,19 @@ class TableMonitor:
 
     def get_cycles_dataframe(self) -> pd.DataFrame:
         """
-        Циклы OCCUPIED → EMPTY → APPROACH.
+        Циклы OCCUPIED → EMPTY → APPROACH в виде DataFrame.
 
-        ИСПРАВЛЕНИЕ NaN-бага: все поля с None остаются Python-None
-        (не конвертируются в int через pandas), поэтому NaN не возникает.
-        Только строки с is_completed=True имеют непустые approach_*.
+        Делегирует построение циклов в ``src.analytics.cycles``,
+        который является единственным источником этой логики.
 
-        Колонки:
-            empty_at_sec      — когда стол освободился (OCCUPIED.end_sec)
-            approach_at_sec   — когда подошёл следующий (APPROACH.start_sec)
-            response_time_sec — разница (метрика ТЗ), None если нет APPROACH
-            is_completed      — True если тройка полная
+        Колонки: см. ``cycles_to_dataframe`` в src/analytics/cycles.py.
         """
-        df = self.get_intervals_dataframe()
-        records = []
-
-        for i in range(len(df)):
-            row = df.iloc[i]
-
-            # Цикл начинается только с EMPTY после OCCUPIED
-            if row["state"] != "EMPTY":
-                continue
-
-            # Проверяем что перед EMPTY был OCCUPIED
-            if i == 0 or df.iloc[i - 1]["state"] != "OCCUPIED":
-                continue
-
-            occupied_row = df.iloc[i - 1]
-
-            record = {
-                "empty_at_frame":    int(row["frame_start"]),
-                "empty_at_sec":      row["start_sec"],
-                # OCCUPIED закончился = EMPTY начался
-                "occupied_end_sec":  occupied_row["end_sec"],
-                "approach_at_frame": None,   # остаётся None — не int(NaN)!
-                "approach_at_sec":   None,
-                "response_time_sec": None,
-                "is_completed":      False,
-            }
-
-            # Ищем следующий APPROACH или OCCUPIED
-            if i + 1 < len(df):
-                nxt = df.iloc[i + 1]
-                if nxt["state"] in ("APPROACH", "OCCUPIED"):
-                    record["approach_at_frame"] = int(nxt["frame_start"])
-                    record["approach_at_sec"]   = nxt["start_sec"]
-                    # Метрика: от момента ухода гостя (OCCUPIED.end = EMPTY.start)
-                    # до момента прихода следующего (APPROACH.start)
-                    record["response_time_sec"] = round(
-                        nxt["start_sec"] - row["start_sec"], 3
-                    )
-                    record["is_completed"] = True
-
-            records.append(record)
-
-        if not records:
-            return pd.DataFrame(columns=[
-                "empty_at_frame", "empty_at_sec", "occupied_end_sec",
-                "approach_at_frame", "approach_at_sec",
-                "response_time_sec", "is_completed",
-            ])
-
-        return pd.DataFrame(records)
+        return cycles_to_dataframe(build_cycles(self.get_intervals_dataframe()))
 
     def get_analytics(self) -> dict:
         """
         Агрегированные метрики по завершённым циклам OCCUPIED→EMPTY→APPROACH.
+        Использует колонки ``is_complete`` и ``wait_time`` из ``cycles_to_dataframe``.
         """
         df = self.get_cycles_dataframe()
 
@@ -419,12 +368,12 @@ class TableMonitor:
             completed_times = []
         else:
             completed_times = (
-                df.loc[df["is_completed"], "response_time_sec"]
+                df.loc[df["is_complete"], "wait_time"]
                 .dropna()
                 .tolist()
             )
 
-        open_count = int((~df["is_completed"]).sum()) if not df.empty else 0
+        open_count = int((~df["is_complete"]).sum()) if not df.empty else 0
 
         result = {
             "completed_cycles":    len(completed_times),
